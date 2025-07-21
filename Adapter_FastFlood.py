@@ -506,7 +506,7 @@ def CommandFastFlood(NameCommand,
 
 def RunScenarios(ProjectPath, FastFloodPath, D, P, Q, SSP, TR,
                  DEM_Path, Manning_Path, Inf_Path, BasinPath, D_DS=None, D_DS_CC=None,
-                 log=None, customurl=None, Channel=None):
+                 log=None, customurl=None, Channel=None, BoundaryCondition=None):
 
     # Residensial
     Results = {'H': {'Currect':[],'BaU':[],'NbS':[]}, 'V': {'Currect':[],'BaU':[],'NbS':[]}, 'Q': {'Currect':[],'BaU':[],'NbS':[]}}
@@ -541,7 +541,7 @@ def RunScenarios(ProjectPath, FastFloodPath, D, P, Q, SSP, TR,
             Comando = CommandFastFlood("Run",
                                          FastFloodPath, customurl=customurl,
                                          DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
-                                         SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, Channel=Channel,
+                                         SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, Channel=Channel, ocean=BoundaryCondition,
                                          H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path, FactorCal=True)
 
         else:
@@ -553,7 +553,7 @@ def RunScenarios(ProjectPath, FastFloodPath, D, P, Q, SSP, TR,
             Comando = CommandFastFlood("Run",
                                          FastFloodPath, customurl=customurl,
                                          DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
-                                         SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, D_DS_CC=D_DS_CC, P=P, Q=Q, Channel=Channel,
+                                         SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, D_DS_CC=D_DS_CC, P=P, Q=Q, Channel=Channel, ocean=BoundaryCondition,
                                          H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path, FactorCal=True)
 
         #'''
@@ -603,7 +603,7 @@ def RunScenarios(ProjectPath, FastFloodPath, D, P, Q, SSP, TR,
             Comando = CommandFastFlood("Run",
                                        FastFloodPath, customurl=customurl,
                                        DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
-                                       SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, Channel=Channel,
+                                       SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, Channel=Channel, ocean=BoundaryCondition,
                                        H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path, FactorCal=True)
 
         else:
@@ -615,7 +615,7 @@ def RunScenarios(ProjectPath, FastFloodPath, D, P, Q, SSP, TR,
             Comando = CommandFastFlood("Run",
                                        FastFloodPath, customurl=customurl,
                                        DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
-                                       SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, D_DS_CC=D_DS_CC, P=P, Q=Q, Channel=Channel,
+                                       SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, D_DS_CC=D_DS_CC, P=P, Q=Q, Channel=Channel, ocean=BoundaryCondition,
                                        H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path, FactorCal=True)
 
         #'''
@@ -665,7 +665,7 @@ def RunScenarios(ProjectPath, FastFloodPath, D, P, Q, SSP, TR,
             Comando = CommandFastFlood("Run",
                                        FastFloodPath, customurl=customurl,
                                        DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
-                                       SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, Channel=Channel,
+                                       SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, Channel=Channel, ocean=BoundaryCondition,
                                        H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path, FactorCal=True)
         else:
             if log is not None:
@@ -676,7 +676,7 @@ def RunScenarios(ProjectPath, FastFloodPath, D, P, Q, SSP, TR,
             Comando = CommandFastFlood("Run",
                                        FastFloodPath, customurl=customurl,
                                        DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
-                                       SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, D_DS_CC=D_DS_CC, P=P, Q=Q, Channel=Channel,
+                                       SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, D_DS_CC=D_DS_CC, P=P, Q=Q, Channel=Channel, ocean=BoundaryCondition,
                                        H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path, FactorCal=True)
 
         #'''
@@ -709,7 +709,7 @@ def ReadDamageCurve(ProjectPath):
 
     return DC
 
-def TR_Damage(df_profundidad, df_costos, category='Residential'):
+def TR_Damage_Old(df_profundidad, df_costos, category='Residential'):
     """
     Interpola/Extrapola los costos para la categoría en función de las profundidades.
 
@@ -754,6 +754,59 @@ def TR_Damage(df_profundidad, df_costos, category='Residential'):
     # Aplicar interpolación a todo el DataFrame de profundidades
     return df_profundidad.applymap(lambda val: interpolador(val))
 
+def TR_Damage(df_profundidad, df_costos, category='Residential'):
+    """
+    Interpola/Extrapola los costos para la categoría en función de las profundidades.
+
+    Parámetros:
+    -----------
+    df_profundidad: DataFrame
+        DataFrame con columnas de periodos de retorno (TR) y filas de ubicaciones/escenarios.
+        Ejemplo:
+                   TR_2      TR_5     TR_10  ...    TR_1000
+            0     0.000031  0.000041  0.000048  ...  0.000133
+            1     0.000088  0.000133  0.000155  ...  0.000417
+
+    df_costos: DataFrame
+        DataFrame con profundidades como índice y costos por categoría.
+        Ejemplo:
+                  Residential  Commercial  ...  Agriculture
+            Flood depth [m]
+            0.0            0.0         0.0  ...          0.0
+            0.5            0.32        0.32 ...          0.32
+
+    category: str, por defecto 'Residential'
+        Nombre de la categoría a interpolar. Debe coincidir con una columna de df_costos.
+
+    Retorna:
+    --------
+    DataFrame
+        DataFrame con los mismos índices y columnas que df_profundidad, con valores interpolados
+        (o extrapolados si es necesario) de costos para la categoría seleccionada.
+    """
+
+    # Extraer datos de profundidad (x) y costos (y) de la categoría
+    x = df_costos.index.to_numpy(dtype=float)            # Profundidades conocidas
+    y = df_costos[category].to_numpy(dtype=float)        # Costos conocidos
+
+    # Ordenar los datos por profundidad (necesario para interp1d)
+    sorted_idx = np.argsort(x)
+    x_sorted = x[sorted_idx]
+    y_sorted = y[sorted_idx]
+
+    # Crear función de interpolación lineal con extrapolación
+    interpolador = interp1d(x_sorted, y_sorted,
+                            kind='linear',
+                            fill_value='extrapolate')
+
+    # Aplicar la interpolación vectorizada al array de profundidades
+    valores_interpolados = interpolador(df_profundidad.values)
+
+    # Reconstruir DataFrame con los mismos índices y columnas
+    return pd.DataFrame(valores_interpolados,
+                        index=df_profundidad.index,
+                        columns=df_profundidad.columns)
+
 def EAD(TR, Damage,NameCol='EAD'):
     # Crear un DataFrame vacío para almacenar resultados
     df_resultado = pd.DataFrame()
@@ -774,7 +827,7 @@ def DesaggregationData(Data, NameCol, NBS, Time):
     """
     # Esta función realiza la desagregación de los daños
     """
-    #"""
+    """
     #Esta función realiza la desagregación de los daños
     Data.iloc[0,:]  = 4000000
     Data.iloc[1,:]  = 10000000
@@ -785,7 +838,7 @@ def DesaggregationData(Data, NameCol, NBS, Time):
     Sigmoid_Desaggregation = lambda Wmax, Wo, r, t: Wmax / (1 + (((Wmax / Wo) - 1) * np.exp(-t * r)))
 
     # ------------------------------------------------------------------------------------------------------------------
-    # Current-BaU
+    # BaU
     # ------------------------------------------------------------------------------------------------------------------
     # Número de items a desagregar
     nn  = np.shape(Data)[1]
@@ -796,67 +849,49 @@ def DesaggregationData(Data, NameCol, NBS, Time):
     Results_BaU = pd.DataFrame(data=np.empty([Time + 1, nn]), columns=NameCol)
     # Desagregación del escenario BaU
     for i in range(0, len(NameCol)):
-        Results_BaU[NameCol[i]] = Sigmoid_Desaggregation(Data[NameCol[i]][1], Data[NameCol[i]][0], r, t)
+        Wmax = Data[NameCol[i]][1]
+        Wo   = Data[NameCol[i]][0]
+        Results_BaU[NameCol[i]] = Sigmoid_Desaggregation(Wmax, Wo, r, t)
 
     # ------------------------------------------------------------------------------------------------------------------
-    # BaU-NBS
+    # NBS
     # ------------------------------------------------------------------------------------------------------------------
-    # Número de años de implementación de NbS
-    n       = np.size(NBS[0, 2:])
+    NBS_Total = np.sum(NBS[:, 2:], 1)
+
     # Estimación de los parámetros de la función logística, ponderando por la cantidad de área de implementación de cada
     # NbS
-    t_NBS   = np.empty([n, 1])
-    p_NBS   = np.empty([n, 1])
-    for i in range(0, n):
-        t_NBS[i] = np.nansum(NBS[:, 0] * NBS[:, i + 2]) / np.nansum(NBS[:, i + 2])
-        p_NBS[i] = np.nansum(NBS[:, 1] * NBS[:, i + 2]) / np.nansum(NBS[:, i + 2])
+    t_NBS   = np.nansum(NBS[:, 0] * NBS_Total) / np.nansum(NBS_Total)
+    p_NBS   = np.nansum(NBS[:, 1] * NBS_Total) / np.nansum(NBS_Total)
 
+    # Calcular
+    NBS_Year    = np.cumsum(np.sum(NBS[:, 2:], 0))
+    NBS_Year    = np.concatenate([np.array([0]), NBS_Year, np.repeat(NBS_Year[-1], Time - 3)])
+    Factor      = NBS_Year / np.sum(NBS_Total)
+
+    # Parámetro r de la función logística
+    r = -1 * np.log(0.000000001) / t_NBS
+    # Parámetro t de la función logística
+    t = np.arange(0, Time+1)
     # Vector vacio de resultados
     Results_NBS = pd.DataFrame(data=np.empty([Time + 1, nn]), columns=NameCol)
+    # Desagregación del escenario NbS
+    for i in range(0, len(NameCol)):
+        Wmax    = Data[NameCol[i]].iloc[2]
+        Diff    = (Data[NameCol[i]][1] - Data[NameCol[i]].iloc[2]  )
+        Wo      = Results_BaU[NameCol[i]][1] - (p_NBS * Diff * 0.01)
 
-    # Estimation Diff
-    [f, c]      = Data.shape
-    Data1       = Data[2:].values
-    Data1[0, :] = Data1[0, :] - Data.loc['BaU'].values
-    Tmp = np.nancumsum(Data1, 0)
-    for i in range(1, f - 2):
-        Data1[i, :] = Data1[i, :] - Data.loc['BaU'].values - Tmp[i - 1, :]
-        Tmp = np.nancumsum(Data1, 0)
+        Results_NBS[NameCol[i]]     = Sigmoid_Desaggregation(Wmax, Wo, r, t)
+        Results_NBS.loc[0, NameCol[i]] = Data[NameCol[i]].iloc[0]
+        Results_NBS.loc[1, NameCol[i]] = Wo
 
-    for i in range(0, nn):
-        Tmp = np.zeros((Time + 1, n))
-        for j in range(0, n):
-            t = np.arange(0, Time + 1 - (j + 1))
-            Wmax = Data1[j, i]
-            tmax = t_NBS[j][0]
-            Wo = p_NBS[j][0] * Data1[j, i] * 0.01
-            r = -1 * np.log(0.000000001) / tmax
+        #Results_NBS[NameCol[i]][0]  = Data[NameCol[i]][0]
+        #Results_NBS[NameCol[i]][1]  = Wo
 
-            # print(Wmax,'|', Wo,'|', r)
-            Tmp[(j + 1):, j] = Sigmoid_Desaggregation(Wmax, Wo, r, t)
+        # Aplicación de factor
+        Results_NBS[NameCol[i]]     = Results_BaU[NameCol[i]] - (Results_BaU[NameCol[i]] - Results_NBS[NameCol[i]])*Factor
 
-        Tmp[np.isnan(Tmp)] = 0
-        Results_NBS[NameCol[i]] = np.sum(Tmp, 1) + Results_BaU[NameCol[i]].values
-
-    # Correct Negative Values
-    Posi = Results_NBS.index.values
-    for i in range(0, nn):
-        print(Data.columns[i])
-        if np.sum(Results_NBS.iloc[:, i] < 0) > 0:
-            TmpBaU = Results_BaU.iloc[:, i]
-            TmpNBS = Results_NBS.iloc[:, i]
-
-            nN = Posi[TmpNBS < 0]
-            V = (TmpBaU[Posi[TmpNBS > 0]] - TmpNBS[Posi[TmpNBS > 0]]) / TmpBaU[Posi[TmpNBS > 0]]
-            V = np.median(V)
-            for j in range(0, len(nN)):
-                TmpNBS[nN[j]] = TmpBaU[nN[j]] * V
-            Results_NBS.iloc[:, i] = TmpNBS
-        else:
-            print(f'The {NameCol[i]} data does not require correction for negative values.')
-
-    Results_BaU = Results_BaU.fillna(0)
-    Results_NBS = Results_NBS.fillna(0)
+    Results_BaU = Results_BaU.fillna(0).infer_objects(copy=False)
+    Results_NBS = Results_NBS.fillna(0).infer_objects(copy=False)
 
     return Results_BaU, Results_NBS
 
@@ -1209,6 +1244,90 @@ def Raster2Zonal(profundidades, shapefile_mascara=None, Threshold_H=0.01):
     return pd.DataFrame(registros)
 
 def Raster2DataFrame_Damages(ruta_cobertura, profundidades, codigos_cobertura, shapefile_mascara=None, Threshold_H=0.01):
+    """
+    Extrae profundidades de uno o varios rásteres en las coordenadas de cobertura seleccionadas,
+    limitando opcionalmente con un shapefile de máscara en WGS84.
+
+    Parámetros:
+        ruta_cobertura (str): Ruta al ráster de cobertura.
+        profundidades (str | dict): Ruta a un solo ráster o diccionario {nombre_columna: ruta}.
+        codigos_cobertura (list): Lista de códigos de cobertura deseados.
+        shapefile_mascara (str, opcional): Ruta a shapefile para limitar el análisis.
+        Threshold_H (float, opcional): Umbral mínimo de profundidad.
+
+    Retorna:
+        pd.DataFrame: Con columnas ['Code', <una o varias columnas de profundidad>]
+    """
+    if isinstance(profundidades, str):
+        profundidades = {'Profundidad': profundidades}
+
+    # Abrir ráster de cobertura y guardar su CRS, shape y transform
+    with rasterio.open(ruta_cobertura) as src_cov:
+        crs_objetivo = src_cov.crs
+        transform = src_cov.transform
+        shape = src_cov.shape
+        cov_data = src_cov.read(1)
+
+    # Leer shapefile de máscara (opcional)
+    geometria_mask = None
+    if shapefile_mascara:
+        gdf = gpd.read_file(shapefile_mascara)
+        if not isinstance(gdf, gpd.GeoDataFrame) or 'geometry' not in gdf:
+            raise ValueError("El archivo proporcionado no es un shapefile válido con geometría.")
+        gdf = gdf.to_crs(crs_objetivo)
+        geometria_mask = gdf.geometry
+
+    # Generar máscara espacial si hay geometría
+    if geometria_mask is not None and geometria_mask.notna().any():
+        mascara_geo = geometry_mask(
+            geometries=geometria_mask,
+            transform=transform,
+            invert=True,
+            out_shape=shape
+        )
+    else:
+        mascara_geo = np.ones(shape, dtype=bool)
+
+    # Máscara por códigos de cobertura
+    mascara_cod = np.isin(cov_data, codigos_cobertura)
+    mascara_total = mascara_cod & mascara_geo
+
+    # Índices válidos
+    filas, columnas = np.where(mascara_total)
+    valores_cobertura = cov_data[filas, columnas]
+
+    # Coordenadas X, Y para exportar o validación (no usadas en extracción ahora)
+    # coords = list(zip(*xy(transform, filas, columnas)))
+
+    # DataFrame base
+    df = pd.DataFrame({'Code': valores_cobertura})
+
+    # Cargar cada capa de profundidad reproyectada y remuestreada al grid del ráster de cobertura
+    for nombre_columna, ruta in profundidades.items():
+        with rasterio.open(ruta) as src_prof:
+            with WarpedVRT(
+                src_prof,
+                crs=crs_objetivo,
+                transform=transform,
+                width=shape[1],
+                height=shape[0],
+                resampling=Resampling.nearest
+            ) as vrt_prof:
+                prof_data = vrt_prof.read(1)  # solo banda 1
+                valores_prof = prof_data[filas, columnas]
+                df[nombre_columna] = valores_prof
+
+    # Aplicar threshold a columnas de profundidad
+    columnas_prof = list(profundidades.keys())
+    for col in columnas_prof:
+        df[col] = np.where(df[col] < Threshold_H, 0, df[col])
+
+    # Eliminar filas donde todas las profundidades son cero
+    df = df[df[columnas_prof].sum(axis=1) != 0]
+
+    return df
+
+def Raster2DataFrame_Damages_Old(ruta_cobertura, profundidades, codigos_cobertura, shapefile_mascara=None, Threshold_H=0.01):
     """
     Extrae profundidades de uno o varios rásteres en las coordenadas de cobertura seleccionadas,
     limitando opcionalmente con un shapefile de máscara en WGS84.
@@ -1658,9 +1777,14 @@ def generate_manning_bau(
         locked_mask = np.isin(lulc_ff, list(locked_categories))
         manning_final = np.where(locked_mask, manning_inicial, np.minimum(manning_inicial, man_temp))
 
-
         no_Data_mask = np.isnan(manning_final)
         manning_final[ no_Data_mask] = manning_inicial[no_Data_mask]
+        manning_final = np.minimum(manning_final, manning_inicial )
+
+        # ❗️Asegurar que ningún valor final supere el inicial (protección contra NaNs)
+        mask_gt = manning_final > manning_inicial
+        manning_final[mask_gt] = manning_inicial[mask_gt]
+
         # ── Guardar ─────────────────────────────────────────────────────────
         meta = lulc_src.meta.copy()
         meta.update(dtype='float32', count=1)
@@ -1719,19 +1843,29 @@ def generate_infiltracion_bau(
                     factor = infiltration_change[key] / 100.0
                     infil_final[i, j] = infil_base[i, j] * (1 + factor)
 
+        # for i in range(rows):
+        #     for j in range(cols):
+        #         key = (int(cobertura_ini[i, j]), int(bau_lulc[i, j]))
+        #         if key in infiltration_change:
+        #             factor = infiltration_change[key] / 100.0
+        #             infil_final[i, j] = infil_base[i, j] * (1 + factor)
+
         for i in range(rows):
             for j in range(cols):
                 key = (int(cobertura_ini[i, j]), int(bau_lulc[i, j]))
-                if key in infiltration_change:
+                if cobertura_ini[i, j] != bau_lulc[i, j] and key in infiltration_change:
                     factor = infiltration_change[key] / 100.0
                     infil_final[i, j] = infil_base[i, j] * (1 + factor)
+
+        # 4️⃣  Check - El BaU no puede ser mejor que el Current
+        infil_final = np.minimum(infil_final, infil_base)
 
         # 4️⃣  Guardar raster resultante
         meta = infil_src.meta.copy()
         meta.update(dtype='float32', count=1)
 
         with rasterio.open(output_path, 'w', **meta) as dst:
-            dst.write(np.round(infil_final, 2).astype(np.float32), 1)
+            dst.write(infil_final.astype(np.float32), 1)
 
 def generate_nbs_manning(
     lulc_raster: str, # LULC FastFlood (alineado)
@@ -1762,7 +1896,6 @@ def generate_nbs_manning(
         flat_lulc = lulc_data_wp.ravel()
         manning_out = manning.ravel()
 
-
         for idx in range(flat_nbs.size):
             key = (flat_nbs[idx], flat_lulc[idx])
             if key in manning_dict:
@@ -1783,9 +1916,9 @@ def generate_nbs_manning(
 
         # 2️⃣ Máscaras lógicas
         locked_mask = np.isin(lulc_data, list(locked_categories))
-        not_locked = ~locked_mask
-        valid_temp = ~np.isnan(temp_data)
-        has_nbs = ~np.isnan(nbs_data)
+        not_locked  = ~locked_mask
+        valid_temp  = ~np.isnan(temp_data)
+        has_nbs     = ~np.isnan(nbs_data)
 
         # 3️⃣ Regla 1: usar temp si mejora y hay NbS
         condition_temp_greater = (temp_data > manning_inicial) & not_locked & valid_temp & has_nbs
@@ -1795,10 +1928,10 @@ def generate_nbs_manning(
 
         remaining_mask = not_locked & valid_temp & ~condition_temp_greater & has_nbs
         if np.any(remaining_mask):
-            nbs_flat = nbs_data[remaining_mask].astype(np.uint8)
-            lulc_flat = lulc_data[remaining_mask].astype(np.uint8)
-            base_flat = manning_inicial[remaining_mask]
-            mapped_lulc_flat = np.vectorize(lulc_fastflood_to_lulc_end.get)(lulc_flat)
+            nbs_flat            = nbs_data[remaining_mask].astype(np.uint8)
+            lulc_flat           = lulc_data[remaining_mask].astype(np.uint8)
+            base_flat           = manning_inicial[remaining_mask]
+            mapped_lulc_flat    = np.vectorize(lulc_fastflood_to_lulc_end.get)(lulc_flat)
 
             final_values = base_flat.copy()
             for idx, (nbs_val, lulc_val) in enumerate(zip(nbs_flat, mapped_lulc_flat)):
@@ -1837,16 +1970,16 @@ def generate_nbs_infiltration(
          rasterio.open(infiltration_base_path) as infil_src,\
          rasterio.open(bau_raster) as bau_src:
 
-        lulc_data = lulc_src.read(1)
-        lulc_data_wp = lulc_src_r.read(1)
-        nbs_data = nbs_src.read(1)
-        bau_data = bau_src.read(1)
+        lulc_data       = lulc_src.read(1)
+        lulc_data_wp    = lulc_src_r.read(1)
+        nbs_data        = nbs_src.read(1)
+        bau_data        = bau_src.read(1)
         infiltration_inicial = infil_src.read(1).astype(np.float32)
 
-        infiltration = np.full(nbs_data.shape, np.nan, dtype=np.float32)
-        flat_nbs = nbs_data.ravel()
-        flat_lulc = lulc_data_wp.ravel()
-        infiltration_out = infiltration.ravel()
+        infiltration        = np.full(nbs_data.shape, np.nan, dtype=np.float32)
+        flat_nbs            = nbs_data.ravel()
+        flat_lulc           = lulc_data_wp.ravel()
+        infiltration_out    = infiltration.ravel()
 
         for idx in range(flat_nbs.size):
             key = (flat_nbs[idx], flat_lulc[idx])
@@ -2059,6 +2192,58 @@ def BashFastFlood(JSONPath):
                               )
 
     # ------------------------------------------------------------------------------------------------------------------
+    # Recortar raster de usos del suelo para daños
+    # ------------------------------------------------------------------------------------------------------------------
+    """
+    01 : MSZ, open spaces, low vegetation surfaces NDVI <= 0.3
+    02 : MSZ, open spaces, medium vegetation surfaces 0.3 < NDVI <=0.5
+    03 : MSZ, open spaces, high vegetation surfaces NDVI > 0.5
+    04 : MSZ, open spaces, water surfaces LAND < 0.5
+    05 : MSZ, open spaces, road surfaces
+    11 : MSZ, built spaces, residential, building height <= 3m
+    12 : MSZ, built spaces, residential, 3m < building height <= 6m
+    13 : MSZ, built spaces, residential, 6m < building height <= 15m
+    14 : MSZ, built spaces, residential, 15m < building height <= 30m
+    15 : MSZ, built spaces, residential, building height > 30m
+    21 : MSZ, built spaces, non-residential, building height <= 3m
+    22 : MSZ, built spaces, non-residential, 3m < building height <= 6m
+    23 : MSZ, built spaces, non-residential, 6m < building height <= 15m
+    24 : MSZ, built spaces, non-residential, 15m < building height <= 30m
+    25 : MSZ, built spaces, non-residential, building height > 30m
+    NoData [255]
+    """
+    # Estos corresponden a los valores de los pixeles en los rasters de coberturas de daño,
+    # que se consideran para evaluar en cada categoría de daño.
+    CodeLULC = {}
+    CodeLULC['Residential'] = [11, 12, 13, 14, 15]
+    CodeLULC['Commercial']  = [21, 22, 23, 24, 25]
+    CodeLULC['Industrial']  = [21, 22, 23, 24, 25]
+    CodeLULC['InfraRoads']  = [1]
+    CodeLULC['Agriculture'] = [40]
+
+    LULC_Damage = {}
+    LULC_Damage['Residential'] = f'{ProjectPath}/in/06-FLOOD/Raster/GHS_BUILT_C_Agri.tif'
+    LULC_Damage['Commercial']  = f'{ProjectPath}/in/06-FLOOD/Raster/GHS_BUILT_C_Agri.tif'
+    LULC_Damage['Industrial']  = f'{ProjectPath}/in/06-FLOOD/Raster/GHS_BUILT_C_Agri.tif'
+    LULC_Damage['InfraRoads']  = f'{ProjectPath}/in/06-FLOOD/Raster/Road.tif'
+    LULC_Damage['Agriculture'] = f'{ProjectPath}/in/06-FLOOD/Raster/GHS_BUILT_C_Agri.tif'
+
+    # Recortar base de datos de GHS-BUILT-C
+    carpeta_tiles   = os.path.join(UserData["DamagesDataBasePath"],"01-GHS-BUILT-C")
+    aoi_path        = UserData['CatchmentPath']
+    ruta_salida     = f'{ProjectPath}/in/06-FLOOD/Raster/GHS_BUILT_C.tif'
+    Clic_Mosaic_DataBase(carpeta_tiles, aoi_path, ruta_salida)
+
+    # Unir los datos de agricultura con GHS-BUILT-C
+    Join_GHSBUILT_Agricultural(ruta_salida , UserData["CurrentLulcPath"], LULC_Damage['Residential'], bloque_tamano=512)
+
+    # Recortar raster de vías
+    carpeta_tiles   = os.path.join(UserData["DamagesDataBasePath"],"02-Road")
+    aoi_path        = UserData['CatchmentPath']
+    ruta_salida     = LULC_Damage['InfraRoads']
+    Clic_Mosaic_DataBase(carpeta_tiles, aoi_path, ruta_salida)
+
+    # ------------------------------------------------------------------------------------------------------------------
     # Ejecutar Escenarios (Historic, BaU, NbS)
     # ------------------------------------------------------------------------------------------------------------------
     log.write("# ---------------------------------------------------------------------------------------------------\n")
@@ -2073,6 +2258,11 @@ def BashFastFlood(JSONPath):
                    UserData["FastFloodParams"]["ChannelParams"]["DepthExp"],
                    UserData["FastFloodParams"]["ChannelParams"]["CrossSection"],
                    UserData["FastFloodParams"]["ChannelParams"]["ChannelManning"]]
+
+    if UserData["FastFloodParams"]["BoundaryCondition"] == 0:
+        BoundaryCondition = None
+    else:
+        BoundaryCondition = UserData["FastFloodParams"]["BoundaryCondition"]
 
     # Ejecutar Escenarios
     HPaths   = RunScenarios( ProjectPath=ProjectPath,
@@ -2090,6 +2280,7 @@ def BashFastFlood(JSONPath):
                              Inf_Path=UserData["InfiltrationPath"],
                              BasinPath=UserData['CatchmentPath'],
                              Channel=Channel,
+                             BoundaryCondition=BoundaryCondition,
                              log=log)
 
     # ------------------------------------------------------------------------------------------------------------------
@@ -2124,32 +2315,9 @@ def BashFastFlood(JSONPath):
     # Se aplica la tasa de cambio en la cual se entregan los costos máximos de las funciones de daño
     DC = DC*UserData["DamagesExchangeRate"]
 
-    """
-    01 : MSZ, open spaces, low vegetation surfaces NDVI <= 0.3
-    02 : MSZ, open spaces, medium vegetation surfaces 0.3 < NDVI <=0.5
-    03 : MSZ, open spaces, high vegetation surfaces NDVI > 0.5
-    04 : MSZ, open spaces, water surfaces LAND < 0.5
-    05 : MSZ, open spaces, road surfaces
-    11 : MSZ, built spaces, residential, building height <= 3m
-    12 : MSZ, built spaces, residential, 3m < building height <= 6m
-    13 : MSZ, built spaces, residential, 6m < building height <= 15m
-    14 : MSZ, built spaces, residential, 15m < building height <= 30m
-    15 : MSZ, built spaces, residential, building height > 30m
-    21 : MSZ, built spaces, non-residential, building height <= 3m
-    22 : MSZ, built spaces, non-residential, 3m < building height <= 6m
-    23 : MSZ, built spaces, non-residential, 6m < building height <= 15m
-    24 : MSZ, built spaces, non-residential, 15m < building height <= 30m
-    25 : MSZ, built spaces, non-residential, building height > 30m
-    NoData [255]
-    """
-    # Estos corresponden a los valores de los pixeles en los rasters de coberturas de daño,
-    # que se consideran para evaluar en cada categoría de daño.
-    CodeLULC = {}
-    CodeLULC['Residential'] = [11, 12, 13, 14, 15]
-    CodeLULC['Commercial']  = [21, 22, 23, 24, 25]
-    CodeLULC['Industrial']  = [21, 22, 23, 24, 25]
-    CodeLULC['InfraRoads']  = [1]
-    CodeLULC['Agriculture'] = [40]
+    log.write("# ---------------------------------------------------------------------------------------------------\n")
+    log.write("# Read Flood Depth - Scenario Current\n")
+    log.write("# ---------------------------------------------------------------------------------------------------\n")
 
     # Las funciones de costo de daño por inundación están en las siguientes unidades
     # Residential ($/m^2)
@@ -2157,54 +2325,27 @@ def BashFastFlood(JSONPath):
     # Industrial  ($/m^2)
     # InfraRoads  ($/m^2)
     # Agriculture ($/m^2)
-    # Dado que los rasters de las categorías de daño están con una resolución de 10 metros
-    # Estos corresponde a los valores de área/km de cada pixel para tener $
-
+    # Para estimar el costo de daño, se multiplican estos valores por el área de cada pixel.
+    # En línea con esto, la base de datos se encuentra en el CSR:
+    # Mollweide(WKID 54009), Albers Equal - Area, Lambert Azimuthal Equal - Area.
+    # Proyección que es equivalente. Es decir que no distorsiona la cantidad de superficie cubierta,
+    # aunque puede distorsionar forma y distancia.
     # Dado que la fuente de datos que se está utilizando para identificar el uso comercial
     # e industrial es GHS_BUILT_C y esta solo mapea el uso no residencial, se aplica
     # el factor extra de distribución ingresado por el usuario
     FactorArea = {}
-    FactorArea['Residential']   = 10*10 #m^2
-    FactorArea['Commercial']    = 10*10*UserData["SplitArea"]["Commercial"] #m^2
-    FactorArea['Industrial']    = 10*10*UserData["SplitArea"]["Industrial"]  #m^2
-    FactorArea['InfraRoads']    = 6*10 #m^2 (Se considera un ancho de vía 6 metros, pixels de 10 metros)
-    FactorArea['Agriculture']   = 10*10 #m^2
-
-    LULC_Damage = {}
-    LULC_Damage['Residential'] = f'{ProjectPath}/in/06-FLOOD/Raster/GHS_BUILT_C_Agri.tif'
-    LULC_Damage['Commercial']  = f'{ProjectPath}/in/06-FLOOD/Raster/GHS_BUILT_C_Agri.tif'
-    LULC_Damage['Industrial']  = f'{ProjectPath}/in/06-FLOOD/Raster/GHS_BUILT_C_Agri.tif'
-    LULC_Damage['InfraRoads']  = f'{ProjectPath}/in/06-FLOOD/Raster/Road.tif'
-    LULC_Damage['Agriculture'] = f'{ProjectPath}/in/06-FLOOD/Raster/GHS_BUILT_C_Agri.tif'
-
-    # ------------------------------------------------------------------------------------------------------------------
-    # Step 8 - Recortar raster de usos del suelo para daños
-    # ------------------------------------------------------------------------------------------------------------------
-    # Recortar base de datos de GHS-BUILT-C
-    carpeta_tiles   = os.path.join(UserData["DamagesDataBasePath"],"01-GHS-BUILT-C")
-    aoi_path        = UserData['CatchmentPath']
-    ruta_salida     = f'{ProjectPath}/in/06-FLOOD/Raster/GHS_BUILT_C.tif'
-    Clic_Mosaic_DataBase(carpeta_tiles, aoi_path, ruta_salida)
-
-    # Unir los datos de agricultura con GHS-BUILT-C
-    Join_GHSBUILT_Agricultural(ruta_salida , UserData["CurrentLulcPath"], LULC_Damage['Residential'], bloque_tamano=512)
-
-    # Recortar raster de vías
-    carpeta_tiles   = os.path.join(UserData["DamagesDataBasePath"],"02-Road")
-    aoi_path        = UserData['CatchmentPath']
-    ruta_salida     = LULC_Damage['InfraRoads']
-    Clic_Mosaic_DataBase(carpeta_tiles, aoi_path, ruta_salida)
-
-    log.write("# ---------------------------------------------------------------------------------------------------\n")
-    log.write("# Read Flood Depth - Scenario Current\n")
-    log.write("# ---------------------------------------------------------------------------------------------------\n")
+    FactorArea['Residential']   = 100 #m^2
+    FactorArea['Commercial']    = 100*UserData["SplitArea"]["Commercial"] #m^2
+    FactorArea['Industrial']    = 100*UserData["SplitArea"]["Industrial"]  #m^2
+    FactorArea['InfraRoads']    = 60 #m^2 (Se considera un ancho de vía 6 metros, pixels de 10 metros)
+    FactorArea['Agriculture']   = 100 #m^2
 
     # Categorias de daño
-    Cat_Damage = ['Residential', 'Commercial', 'Industrial', 'InfraRoads', 'Agriculture']
+    Cat_Damage  = ['Residential', 'Commercial', 'Industrial', 'InfraRoads', 'Agriculture']
     # Nombre de los escenarios
     NameSce     = ['Current', 'BaU', 'NbS']
     # Crear un DataFrame vacío para almacenar resultados
-    Total_EAD =  pd.DataFrame(columns=Cat_Damage,index=NameSce)
+    Total_EAD   = pd.DataFrame(columns=Cat_Damage,index=NameSce)
 
     for Sce in NameSce:
         # --------------------------------------------------------------------------------------------------------------
@@ -2247,7 +2388,7 @@ def BashFastFlood(JSONPath):
             log.write(f"Estimated annual expected damages for the {Sce} scenario for {Cat} damages category- Ok- Ok \n")
 
             # Agregar datos
-            Total_EAD.loc[Sce][Cat] = OutEAD.sum().sum()
+            Total_EAD.loc[Sce, Cat] = OutEAD.sum().sum()
             log.write(f"Estimated cumulative annual expected damages for the {Sce} scenario for {Cat} damages category- Ok- Ok \n")
 
     # Guardar total
@@ -2267,8 +2408,6 @@ def BashFastFlood(JSONPath):
 
     # Leer datos de la NBS
     NBS     = pd.read_csv(os.path.join(ProjectPath,'in','05-DISAGGREGATION','01-INPUTS_NBS.csv')).values[:, 1:]
-    NBS[:, 2] = np.sum(NBS[:, 2:], 1)
-    NBS     = NBS[:,0:3]
 
     # Leer datos de tiempo
     Time    = pd.read_csv(os.path.join(ProjectPath,'in','05-DISAGGREGATION','01-INPUTS_Time.csv')).values[0][0]
