@@ -1867,7 +1867,7 @@ def generate_infiltracion_bau(
         with rasterio.open(output_path, 'w', **meta) as dst:
             dst.write(infil_final.astype(np.float32), 1)
 
-def generate_nbs_manning(
+def generate_nbs_manning_Old(
     lulc_raster: str, # LULC FastFlood (alineado)
     lulc_raster_r_path: str, # LULC waterproof (alineado)
     nbs_raster: str, # Portafolio (alineado)
@@ -1882,18 +1882,18 @@ def generate_nbs_manning(
 ):
     """Build final NbS Manning raster based on prioritized actions, respecting locked areas and improving from BaU when allowed."""
     with rasterio.open(lulc_raster) as lulc_src, \
-         rasterio.open(lulc_raster_r_path) as lulc_src_r, \
+        rasterio.open(lulc_raster_r_path) as lulc_src_r, \
         rasterio.open(nbs_raster) as nbs_src, \
         rasterio.open(bau_raster) as bau_src:
 
-        lulc_data = lulc_src.read(1)
-        lulc_data_wp = lulc_src_r.read(1)
-        nbs_data = nbs_src.read(1)
-        bau_data = bau_src.read(1)
+        lulc_data       = lulc_src.read(1)
+        lulc_data_wp    = lulc_src_r.read(1)
+        nbs_data        = nbs_src.read(1)
+        bau_data        = bau_src.read(1)
 
-        manning = np.full(nbs_data.shape, np.nan, dtype=np.float32)
-        flat_nbs = nbs_data.ravel()
-        flat_lulc = lulc_data_wp.ravel()
+        manning     = np.full(nbs_data.shape, np.nan, dtype=np.float32)
+        flat_nbs    = nbs_data.ravel()
+        flat_lulc   = lulc_data_wp.ravel()
         manning_out = manning.ravel()
 
         for idx in range(flat_nbs.size):
@@ -1902,7 +1902,7 @@ def generate_nbs_manning(
                 manning_out[idx] = manning_dict[key]
 
         # Reshape a la forma original
-        temp_data =  manning_out.reshape(nbs_data .shape)
+        temp_data =  manning_out.reshape(nbs_data.shape)
 
         # 1️⃣ Manning inicial desde LULC base
         if use_raster and manning_base_path:
@@ -1925,7 +1925,6 @@ def generate_nbs_manning(
         manning_final[condition_temp_greater] = temp_data[condition_temp_greater]
 
         # 4️⃣ Regla 2: usar tabla (NbS, LULC) cuando temp no mejora pero hay NbS
-
         remaining_mask = not_locked & valid_temp & ~condition_temp_greater & has_nbs
         if np.any(remaining_mask):
             nbs_flat            = nbs_data[remaining_mask].astype(np.uint8)
@@ -1951,7 +1950,94 @@ def generate_nbs_manning(
         with rasterio.open(output_path, "w", **meta) as dst:
             dst.write(manning_final.astype(np.float32), 1)
 
-def generate_nbs_infiltration(
+def generate_nbs_manning(
+        lulc_raster: str,  # Raster de uso de suelo base (FastFlood)
+        lulc_raster_r_path: str,  # Raster de uso de suelo Waterproof
+        nbs_raster: str,  # Raster con portafolio de acciones NbS priorizadas
+        bau_raster: str,  # Raster de coeficientes de Manning BaU (sin NbS)
+        output_path: str,  # Ruta donde se guardará el raster final
+        lulc_mapping: Dict[int, float],  # Mapeo LULC → coeficiente de Manning
+        lulc_fastflood_to_lulc_end: Dict[int, int],  # Conversión LULC FastFlood → LULC final
+        locked_categories: Set[int],  # Categorías que no se deben modificar (bloqueadas)
+        manning_dict: Dict[Tuple[int, int], float],  # Mapeo (NbS, LULC) → coeficiente de Manning
+        manning_base_path: Optional[str] = None,  # Raster alternativo de Manning base
+        use_raster: bool = False  # Usar manning_base_path en lugar de lulc_mapping
+):
+    """
+    Genera un raster de Manning basado en el escenario BaU, y modifica únicamente
+    las celdas con NbS válidas y no bloqueadas aplicando manning_dict.
+    """
+    with rasterio.open(lulc_raster) as lulc_src, \
+         rasterio.open(lulc_raster_r_path) as lulc_src_r, \
+         rasterio.open(nbs_raster) as nbs_src, \
+         rasterio.open(bau_raster) as bau_src:
+
+        lulc_data       = lulc_src.read(1)
+        lulc_data_wp    = lulc_src_r.read(1)
+        nbs_data        = nbs_src.read(1)
+        bau_data        = bau_src.read(1)
+
+        # Iniciar el raster final como copia exacta de BaU
+        manning_final = bau_data.copy()
+
+        # Construir matriz temporal con valores de manning_dict para cada (NbS, LULC)
+        manning_temp = np.full(nbs_data.shape, np.nan, dtype=np.float32)
+        flat_nbs     = nbs_data.ravel()
+        flat_lulc    = lulc_data_wp.ravel()
+        flat_temp    = manning_temp.ravel()
+
+        for idx in range(flat_nbs.size):
+            key = (flat_nbs[idx], flat_lulc[idx])
+            if key in manning_dict:
+                flat_temp[idx] = manning_dict[key]
+
+        temp_data = flat_temp.reshape(nbs_data.shape)
+
+        # Generar manning_inicial solo donde hay NbS
+        if use_raster and manning_base_path:
+            with rasterio.open(manning_base_path) as man_src:
+                manning_inicial = man_src.read(1).astype(np.float32)
+        else:
+            manning_inicial = np.vectorize(lulc_mapping.get)(
+                lulc_data).astype(np.float32)
+
+        # Máscaras
+        has_nbs     = ~np.isnan(nbs_data)
+        locked_mask = np.isin(lulc_data, list(locked_categories))
+        not_locked  = ~locked_mask
+        valid_temp  = ~np.isnan(temp_data)
+
+        # REGLA 1: usar temp si mejora y hay NbS
+        condition_temp_greater = (temp_data > manning_inicial) & not_locked & valid_temp & has_nbs
+        manning_final[condition_temp_greater] = temp_data[condition_temp_greater]
+
+        # REGLA 2: usar tabla NbS-LULC final si temp no mejora
+        remaining_mask = not_locked & valid_temp & ~condition_temp_greater & has_nbs
+        if np.any(remaining_mask):
+            nbs_flat            = nbs_data[remaining_mask].astype(np.uint8)
+            lulc_flat           = lulc_data[remaining_mask].astype(np.uint8)
+            base_flat           = manning_inicial[remaining_mask]
+            mapped_lulc_flat    = np.vectorize(lulc_fastflood_to_lulc_end.get)(lulc_flat)
+
+            final_values = base_flat.copy()
+            for idx, (nbs_val, lulc_val) in enumerate(zip(nbs_flat, mapped_lulc_flat)):
+                key = (nbs_val, lulc_val)
+                if key in manning_dict:
+                    final_values[idx] = manning_dict[key]
+
+            manning_final[remaining_mask] = final_values
+
+        # ✅ No tocar las celdas sin NbS: ya tienen los valores de bau_data
+
+        # Guardar resultado
+        meta = lulc_src.meta.copy()
+        meta.update(dtype="float32", count=1)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with rasterio.open(output_path, "w", **meta) as dst:
+            dst.write(manning_final.astype(np.float32), 1)
+
+
+def generate_nbs_infiltration_old(
     lulc_raster: str,                     # LULC FastFlood (alineado)
     lulc_raster_r_path: str,             # LULC waterproof (alineado)
     nbs_raster: str,                     # Portafolio (alineado)
@@ -2023,6 +2109,84 @@ def generate_nbs_infiltration(
         infiltration_final[no_nbs_mask] = bau_data[no_nbs_mask]
 
         # Guardar raster final
+        meta = lulc_src.meta.copy()
+        meta.update(dtype="float32", count=1)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with rasterio.open(output_path, "w", **meta) as dst:
+            dst.write(infiltration_final.astype(np.float32), 1)
+
+def generate_nbs_infiltration(
+    lulc_raster: str,  # LULC FastFlood (alineado)
+    lulc_raster_r_path: str,  # LULC waterproof (alineado)
+    nbs_raster: str,  # Portafolio (alineado)
+    infiltration_base_path: str,  # Raster base de infiltración (sin NbS)
+    bau_raster: str,  # Raster BaU de infiltración
+    output_path: str,
+    lulc_fastflood_to_lulc_end: Dict[int, int],
+    locked_categories: Set[int],
+    infiltration_dict: Dict[Tuple[int, int], float]
+):
+    """Genera un raster de infiltración modificado por NbS, partiendo del raster BaU
+    y aplicando mejoras solo en celdas con NbS y no bloqueadas.
+    """
+    with rasterio.open(lulc_raster) as lulc_src, \
+         rasterio.open(lulc_raster_r_path) as lulc_src_r, \
+         rasterio.open(nbs_raster) as nbs_src, \
+         rasterio.open(infiltration_base_path) as infil_src, \
+         rasterio.open(bau_raster) as bau_src:
+
+        lulc_data    = lulc_src.read(1)
+        lulc_data_wp = lulc_src_r.read(1)
+        nbs_data     = nbs_src.read(1)
+        base_data    = infil_src.read(1).astype(np.float32)  # infiltración por LULC
+        bau_data     = bau_src.read(1).astype(np.float32)    # infiltración BaU
+
+        # 1️⃣ Iniciar con copia del BaU: TODO queda igual salvo NbS
+        infiltration_final = bau_data.copy()
+
+        # 2️⃣ Crear matriz temporal de posibles mejoras
+        infiltration_temp = np.full(nbs_data.shape, np.nan, dtype=np.float32)
+        flat_nbs          = nbs_data.ravel()
+        flat_lulc         = lulc_data_wp.ravel()
+        infiltration_out  = infiltration_temp.ravel()
+
+        for idx in range(flat_nbs.size):
+            key = (flat_nbs[idx], flat_lulc[idx])
+            if key in infiltration_dict:
+                infiltration_out[idx] = infiltration_dict[key]
+
+        temp_data = infiltration_out.reshape(nbs_data.shape)
+
+        # 3️⃣ Máscaras
+        has_nbs     = ~np.isnan(nbs_data)
+        locked_mask = np.isin(lulc_data, list(locked_categories))
+        not_locked  = ~locked_mask
+        valid_temp  = ~np.isnan(temp_data)
+
+        # 4️⃣ Regla 1: si mejora (más infiltración), se usa
+        condition_temp_greater = (temp_data > base_data) & not_locked & valid_temp & has_nbs
+        infiltration_final[condition_temp_greater] = temp_data[condition_temp_greater]
+
+        # 5️⃣ Regla 2: si no mejora pero hay NbS, intentar con (NbS, LULC_final)
+        remaining_mask = not_locked & valid_temp & ~condition_temp_greater & has_nbs
+        if np.any(remaining_mask):
+            nbs_flat         = nbs_data[remaining_mask].astype(np.uint8)
+            lulc_flat        = lulc_data[remaining_mask].astype(np.uint8)
+            base_flat        = base_data[remaining_mask]
+            mapped_lulc_flat = np.vectorize(lulc_fastflood_to_lulc_end.get)(lulc_flat)
+
+            final_values = base_flat.copy()
+            for idx, (nbs_val, lulc_val) in enumerate(zip(nbs_flat, mapped_lulc_flat)):
+                key = (nbs_val, lulc_val)
+                if key in infiltration_dict:
+                    final_values[idx] = infiltration_dict[key]
+
+            infiltration_final[remaining_mask] = final_values
+
+        # ✅ No se aplica ninguna modificación fuera de zonas con NbS
+        # Las zonas sin NbS siguen con bau_data porque infiltration_final = bau_data.copy()
+
+        # 6️⃣ Guardar salida
         meta = lulc_src.meta.copy()
         meta.update(dtype="float32", count=1)
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -2183,8 +2347,8 @@ def BashFastFlood(JSONPath):
     generate_nbs_infiltration(aligned["lulc_fastflood"],  # LULC FastFlood (alineado)
                               aligned["waterproof_current"],  # LULC waterproof (alineado)
                               aligned["portafolio"],  # Portafolio (alineado)
-                              os.path.join(ProjectPath, "in", "06-FLOOD", "Raster", "Infiltration_BaU.tif"),
                               aligned["infiltracion_base"],  # Infiltracion Base
+                              os.path.join(ProjectPath, "in", "06-FLOOD", "Raster", "Infiltration_BaU.tif"),
                               os.path.join(ProjectPath, "in", "06-FLOOD", "Raster", "Infiltration_NbS.tif"),
                               lulc_fastflood_to_lulc_end,  # Mapeo de LULC FF a final
                               locked_categories,  # Categorías que no deben cambiar
