@@ -1816,7 +1816,7 @@ def generate_infiltracion_bau(
          rasterio.open(infil_base_path) as infil_src:
 
         lulc_ff    = lulc_src.read(1)
-        lulc_wp = lulc_r_src.read(1)
+        lulc_wp    = lulc_r_src.read(1)
         bau_lulc   = bau_src.read(1)
         infil_base = infil_src.read(1).astype(np.float32)
 
@@ -2115,7 +2115,7 @@ def generate_nbs_infiltration_old(
         with rasterio.open(output_path, "w", **meta) as dst:
             dst.write(infiltration_final.astype(np.float32), 1)
 
-def generate_nbs_infiltration(
+def generate_nbs_infiltration_Value(
     lulc_raster: str,  # LULC FastFlood (alineado)
     lulc_raster_r_path: str,  # LULC waterproof (alineado)
     nbs_raster: str,  # Portafolio (alineado)
@@ -2193,6 +2193,84 @@ def generate_nbs_infiltration(
         with rasterio.open(output_path, "w", **meta) as dst:
             dst.write(infiltration_final.astype(np.float32), 1)
 
+def generate_nbs_infiltration(
+    lulc_raster: str,  # LULC FastFlood (alineado)
+    lulc_raster_r_path: str,  # LULC waterproof (alineado)
+    nbs_raster: str,  # Portafolio (alineado)
+    infiltration_base_path: str,  # Raster base de infiltración (sin NbS)
+    bau_raster: str,  # Raster BaU de infiltración
+    output_path: str,
+    lulc_fastflood_to_lulc_end: Dict[int, int],
+    locked_categories: Set[int],
+    infiltration_dict: Dict[Tuple[int, int], float]  # Valores entre 1 y 100 (porcentaje)
+):
+    """Genera un raster de infiltración final aplicando aumentos porcentuales
+    definidos por NbS, manteniendo valores de BaU donde no hay NbS.
+    """
+    with rasterio.open(lulc_raster) as lulc_src, \
+         rasterio.open(lulc_raster_r_path) as lulc_src_r, \
+         rasterio.open(nbs_raster) as nbs_src, \
+         rasterio.open(infiltration_base_path) as infil_src, \
+         rasterio.open(bau_raster) as bau_src:
+
+        lulc_data    = lulc_src.read(1)
+        lulc_data_wp = lulc_src_r.read(1)
+        nbs_data     = nbs_src.read(1)
+        base_data    = infil_src.read(1).astype(np.float32)  # valor actual de infiltración
+        bau_data     = bau_src.read(1).astype(np.float32)    # infiltración sin NbS (referencia)
+
+        # Inicializar resultado final como copia exacta del BaU
+        infiltration_final = bau_data.copy()
+
+        # Crear raster temporal con mejoras basadas en porcentaje
+        infiltration_temp = np.full(nbs_data.shape, np.nan, dtype=np.float32)
+        flat_nbs          = nbs_data.ravel()
+        flat_lulc         = lulc_data_wp.ravel()
+        flat_base         = base_data.ravel()
+        infiltration_out  = infiltration_temp.ravel()
+
+        for idx in range(flat_nbs.size):
+            key = (flat_nbs[idx], flat_lulc[idx])
+            if key in infiltration_dict:
+                percentage = infiltration_dict[key] / 100.0  # convertir de 1-100 a 0.01-1.0
+                infiltration_out[idx] = flat_base[idx] * (1 + percentage)
+
+        temp_data = infiltration_out.reshape(nbs_data.shape)
+
+        # Máscaras
+        has_nbs     = ~np.isnan(nbs_data)
+        locked_mask = np.isin(lulc_data, list(locked_categories))
+        not_locked  = ~locked_mask
+        valid_temp  = ~np.isnan(temp_data)
+
+        # Regla 1: aplicar aumento si mejora (más infiltración)
+        condition_temp_greater = (temp_data > base_data) & not_locked & valid_temp & has_nbs
+        infiltration_final[condition_temp_greater] = temp_data[condition_temp_greater]
+
+        # Regla 2: si no mejora, intentar con LULC final
+        remaining_mask = not_locked & valid_temp & ~condition_temp_greater & has_nbs
+        if np.any(remaining_mask):
+            nbs_flat         = nbs_data[remaining_mask].astype(np.uint8)
+            lulc_flat        = lulc_data[remaining_mask].astype(np.uint8)
+            base_flat        = base_data[remaining_mask]
+            mapped_lulc_flat = np.vectorize(lulc_fastflood_to_lulc_end.get)(lulc_flat)
+
+            final_values = base_flat.copy()
+            for idx, (nbs_val, lulc_val) in enumerate(zip(nbs_flat, mapped_lulc_flat)):
+                key = (nbs_val, lulc_val)
+                if key in infiltration_dict:
+                    percentage = infiltration_dict[key] / 100.0
+                    final_values[idx] = base_flat[idx] * (1 + percentage)
+
+            infiltration_final[remaining_mask] = final_values
+
+        # Guardar raster final
+        meta = lulc_src.meta.copy()
+        meta.update(dtype="float32", count=1)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with rasterio.open(output_path, "w", **meta) as dst:
+            dst.write(infiltration_final.astype(np.float32), 1)
+
 def red_params_from_json(json_path):
     # Extraer códigos de NbS desde claves como "5-Conservation"
     def extract_codes_from_keys(data_dict, separator="-"):
@@ -2200,7 +2278,6 @@ def red_params_from_json(json_path):
     # Leer archivo
     with open(json_path, "r") as f:
         config = json.load(f)
-
 
     inputs_paths = {
         "lulc_fastflood"   : config["FastFloodLulcPath"],
@@ -2248,7 +2325,6 @@ def red_params_from_json(json_path):
             infiltration_change_dict[(ini_code, fin_code)] = val
 
     return lulc_to_manning,manning_dict, infiltracion_dict, infiltration_change_dict, inputs_paths,path_out
-
 
 def BashFastFlood(JSONPath):
 
