@@ -55,10 +55,186 @@ from rasterio.transform import xy
 from rasterio.vrt import WarpedVRT
 from rasterio.warp import reproject
 
+import os
+import time
+import glob
+import pandas as pd
+import rasterio
+from rasterio.crs import CRS
+from rasterio.io import MemoryFile
+from rasterio.errors import RasterioIOError
+import rasterio.mask
+from rasterio.merge import merge
+import fiona
+from shapely.geometry import shape, box, MultiPolygon
+from shapely.ops import unary_union
+from shapely.geometry.base import BaseGeometry
+from pyproj import Transformer
+from rasterio.features import geometry_mask
+
+import os
+import glob
+import numpy as np
+import pandas as pd
+import rasterio
+import rasterio.mask
+import geopandas as gpd
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import warnings
+
+import rasterio
+import rasterio.mask
+import rasterio.windows
+from rasterio.features import geometry_mask
+import geopandas as gpd
+import pandas as pd
+import numpy as np
+from osgeo import gdal
+import os
+import time
+
+warnings.filterwarnings('ignore')
+
 # === Otros (no utilizados explícitamente o dudosos) ===
 # from numpy.core._multiarray_umath import ndarray  # innecesario, ya viene con numpy
 # from fontTools.misc.cython import returns  # no parece ser usado en tu código
 
+def calcular_estadisticas_idf_cuenca(carpeta_rasters, shapefile_cuenca, estadistica='mean'):
+    """
+    Calcula estadísticas de rasters IDF para una cuenca y organiza en formato tabla IDF.
+
+    Parámetros:
+    -----------
+    carpeta_rasters : str
+        Ruta a la carpeta con rasters con nombres tipo: IDF_TR_2_D_240
+    shapefile_cuenca : str
+        Ruta al shapefile de la cuenca
+    estadistica : str
+        Estadística a calcular: 'mean', 'min', 'max', 'std', 'median', 'sum'
+
+    Retorna:
+    --------
+    pandas.DataFrame
+        DataFrame con duraciones como filas y períodos de retorno como columnas
+    """
+
+    # Cargar cuenca
+    print("Cargando cuenca...")
+    cuenca = gpd.read_file(shapefile_cuenca)
+    if cuenca.crs != 'EPSG:4326':
+        cuenca = cuenca.to_crs('EPSG:4326')
+
+    # Obtener archivos raster
+    raster_files = glob.glob(os.path.join(carpeta_rasters, "IDF_TR_*_D_*.tif"))
+    if not raster_files:
+        raster_files = glob.glob(os.path.join(carpeta_rasters, "IDF_TR_*_D_*.tiff"))
+
+    if not raster_files:
+        raise ValueError("No se encontraron archivos IDF con el formato esperado")
+
+    print(f"Encontrados {len(raster_files)} archivos IDF")
+
+    # Definir estadísticas
+    stats_functions = {
+        'mean': np.nanmean,
+        'min': np.nanmin,
+        'max': np.nanmax,
+        'std': np.nanstd,
+        'median': np.nanmedian,
+        'sum': np.nansum
+    }
+
+    if estadistica not in stats_functions:
+        raise ValueError(f"Estadística '{estadistica}' no disponible. Opciones: {list(stats_functions.keys())}")
+
+    stat_func = stats_functions[estadistica]
+
+    # Procesar cada raster
+    def procesar_raster_idf(raster_path):
+        try:
+            nombre_archivo = os.path.basename(raster_path)
+
+            # Extraer TR y D del nombre del archivo
+            # Formato: IDF_TR_2_D_240.tif
+            partes = nombre_archivo.replace('.tif', '').replace('.tiff', '').split('_')
+            tr_idx = partes.index('TR') + 1
+            d_idx = partes.index('D') + 1
+
+            periodo_retorno = int(partes[tr_idx])
+            duracion = int(partes[d_idx])
+
+            with rasterio.open(raster_path) as src:
+                # Extraer píxeles usando mask
+                masked_data, _ = rasterio.mask.mask(
+                    src, cuenca.geometry, crop=True, all_touched=True, filled=False
+                )
+
+                # Tomar primera banda si es multiband
+                if masked_data.ndim > 2:
+                    masked_data = masked_data[0]
+
+                # Obtener píxeles válidos
+                if hasattr(masked_data, 'mask'):
+                    valid_pixels = masked_data[~masked_data.mask]
+                else:
+                    valid_pixels = masked_data.flatten()
+
+                valid_pixels = valid_pixels[~np.isnan(valid_pixels)]
+
+                if len(valid_pixels) == 0:
+                    valor_estadistica = np.nan
+                else:
+                    valor_estadistica = stat_func(valid_pixels)
+
+                return {
+                    'periodo_retorno': periodo_retorno,
+                    'duracion': duracion,
+                    'valor': valor_estadistica,
+                    'archivo': nombre_archivo
+                }
+
+        except Exception as e:
+            print(f"Error procesando {raster_path}: {e}")
+            return None
+
+    # Procesamiento paralelo
+    print("Procesando rasters...")
+    resultados = []
+
+    with ThreadPoolExecutor() as executor:
+        futures = {executor.submit(procesar_raster_idf, raster_path): raster_path
+                   for raster_path in raster_files}
+
+        for i, future in enumerate(as_completed(futures), 1):
+            resultado = future.result()
+            if resultado is not None:
+                resultados.append(resultado)
+            print(f"Procesado {i}/{len(raster_files)}")
+
+    if not resultados:
+        raise ValueError("No se pudieron procesar archivos")
+
+    # Crear DataFrame temporal
+    df_temp = pd.DataFrame(resultados)
+
+    # Crear tabla pivote: duraciones como filas, períodos de retorno como columnas
+    df_idf = df_temp.pivot(index='duracion', columns='periodo_retorno', values='valor')
+
+    # Ordenar filas (duraciones) y columnas (períodos de retorno)
+    duraciones_ordenadas = [3, 6, 12, 24, 48, 72, 120, 240]
+    periodos_ordenados = [2, 5, 10, 20, 40, 50, 100, 200, 500, 1000]
+
+    # Filtrar solo duraciones y períodos que existen en los datos
+    duraciones_existentes = [d for d in duraciones_ordenadas if d in df_idf.index]
+    periodos_existentes = [p for p in periodos_ordenados if p in df_idf.columns]
+
+    df_idf = df_idf.loc[duraciones_existentes, periodos_existentes]
+
+    print(f"\nCompletado! Tabla IDF con estadística '{estadistica}'")
+    print(f"Duraciones: {duraciones_existentes}")
+    print(f"Períodos de retorno: {periodos_existentes}")
+
+    return df_idf
 
 def CreateFolders(base_path):
     '''
@@ -182,6 +358,53 @@ def CheckPixelDepth_BAU_NBS(ruta_raster1, ruta_raster2, salida='raster_recortado
 
             # Aplicar corrección
             resultado = np.where(data2 > data1, data1, data2)
+
+            # Determinar tipo de dato mínimo necesario
+            dtype_resultado = resultado.dtype.name
+
+            # Metadatos de salida (usamos src2, no el VRT)
+            perfil = src2.profile.copy()
+            perfil.update({
+                'dtype': dtype_resultado,
+                'compress': 'LZW',
+                'predictor': 2 if np.issubdtype(resultado.dtype, np.floating) else 1,
+                'tiled': True,
+                'blockxsize': 256,
+                'blockysize': 256,
+                'BIGTIFF': 'IF_SAFER',
+                'nodata': src2.nodata
+            })
+
+            # Guardar ráster corregido
+            with rasterio.open(salida, 'w', **perfil) as dst:
+                dst.write(resultado, 1)
+
+    print(f"✔️ Raster corregido guardado como: {salida} ({dtype_resultado}, LZW)")
+
+def CheckPixelDepth_BAU_Current(ruta_raster1, ruta_raster2, salida='raster_recortado.tif'):
+    """
+    Compara dos rásteres píxel a píxel. Si raster2 > raster1, reemplaza ese valor por el de raster1.
+    Guarda el resultado con compresión LZW, tipo de dato ajustado automáticamente y bloques optimizados.
+
+    Parámetros:
+        ruta_raster1 (str): Ruta al primer ráster (valor límite superior).
+        ruta_raster2 (str): Ruta al segundo ráster (a corregir si excede).
+        salida (str): Ruta del archivo de salida corregido.
+    """
+
+    with rasterio.open(ruta_raster1) as src1, rasterio.open(ruta_raster2) as src2:
+        # Validación de dimensiones y CRS
+        assert src1.shape == src2.shape, "Los rásteres deben tener la misma dimensión"
+        assert src1.crs == src2.crs, "Los CRS deben coincidir"
+
+        with WarpedVRT(src1, resampling=Resampling.nearest) as vrt1, \
+             WarpedVRT(src2, resampling=Resampling.nearest) as vrt2:
+
+            data1 = vrt1.read(1)
+            data2 = vrt2.read(1)
+
+            # Aplicar corrección
+            resultado = np.where(data2 < data1, data1, data2)
 
             # Determinar tipo de dato mínimo necesario
             dtype_resultado = resultado.dtype.name
@@ -362,7 +585,7 @@ def CommandFastFlood(NameCommand,
                      DEM_Path=None, Manning_Path=None, Inf_Path=None, IDF_Path=None, Fac_CC_Path=None,
                      D_DS=None, D_DS_CC=None, D=None, P=None, Q=None, SSP=None, TR=None,
                      H_Path=None, Q_Path=None, V_Path=None, nOut=None, InfOut=None, PathShp=None, Verbose=True,
-                     ChW_Path=None,ChD_Path=None,TS_Path=None,Channel=None,LULC_Path=None, ocean=None,
+                     ChW_Path=None,ChD_Path=None,TS_Path=None,Channel=None,LULC_Path=None, ocean=None, Rain=None,
                      FactorCal=False):
     """
     Construye el comando para ejecutar FastFlood desde línea de comandos.
@@ -471,8 +694,10 @@ def CommandFastFlood(NameCommand,
         Comando += ['-man', Manning_Path]
     if (Inf_Path is not None) and (NameCommand == 'Run'):
         Comando += ['-inf', Inf_Path]
-    if (TR is not None) and (D_DS is not None):
+    if (TR is not None) and (D_DS is not None) and (Rain is None):
         Comando += ['-designstorm', f'{TR}', f'{D_DS}']
+    if (Rain is not None):
+        Comando += ['-rain', f'{Rain}']
     if (D is not None):
         Comando += ['-dur', f'{D}']
     if (P is not None) and (Q is not None) and (TR is not None) and (D_DS_CC is not None) and (SSP != "Historic"):
@@ -506,7 +731,8 @@ def CommandFastFlood(NameCommand,
 
 def RunScenarios(ProjectPath, FastFloodPath, D, P, Q, SSP, TR,
                  DEM_Path, Manning_Path, Inf_Path, BasinPath, D_DS=None, D_DS_CC=None,
-                 log=None, customurl=None, Channel=None, BoundaryCondition=None):
+                 log=None, customurl=None, Channel=None, BoundaryCondition=None,IDF_Table=None,StatusExe=True):
+
 
     # Residensial
     Results = {'H': {'Currect':[],'BaU':[],'NbS':[]}, 'V': {'Currect':[],'BaU':[],'NbS':[]}, 'Q': {'Currect':[],'BaU':[],'NbS':[]}}
@@ -538,11 +764,21 @@ def RunScenarios(ProjectPath, FastFloodPath, D, P, Q, SSP, TR,
                 log.write(f"# Execution FastFlood | Scenario: Current | Climate: Historic | TR: {TR_i} | Duration: {D} \n")
                 log.write("# ---------------------------------------------------------------------------------------------------\n")
 
-            Comando = CommandFastFlood("Run",
-                                         FastFloodPath, customurl=customurl,
-                                         DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
-                                         SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, Channel=Channel, ocean=BoundaryCondition,
-                                         H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path, FactorCal=True)
+            if IDF_Table is not None:
+                ValueStorm = IDF_Table.loc[D_DS, TR_i]
+                Comando = CommandFastFlood("Run",
+                                             FastFloodPath, customurl=customurl,
+                                             DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
+                                             SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, Rain=ValueStorm,Channel=Channel, ocean=BoundaryCondition,
+                                             H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path, FactorCal=True)
+            else:
+                Comando = CommandFastFlood("Run",
+                                           FastFloodPath, customurl=customurl,
+                                           DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
+                                           SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, Channel=Channel, ocean=BoundaryCondition,
+                                           H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path,
+                                           FactorCal=True)
+
 
         else:
             if log is not None:
@@ -550,20 +786,31 @@ def RunScenarios(ProjectPath, FastFloodPath, D, P, Q, SSP, TR,
                 log.write(f"# Execution FastFlood | Scenario: Current | Climate: Scenario: {SSP} | Period: {P} | Quantile: {Q} | TR: {TR_i} | Duration: {D} \n")
                 log.write("# ---------------------------------------------------------------------------------------------------\n")
 
-            Comando = CommandFastFlood("Run",
-                                         FastFloodPath, customurl=customurl,
-                                         DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
-                                         SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, D_DS_CC=D_DS_CC, P=P, Q=Q, Channel=Channel, ocean=BoundaryCondition,
-                                         H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path, FactorCal=True)
+            if IDF_Table is not None:
+                ValueStorm = IDF_Table.loc[D_DS, TR_i]
+                Comando = CommandFastFlood("Run",
+                                             FastFloodPath, customurl=customurl,
+                                             DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
+                                             SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, Rain=ValueStorm, D_DS_CC=D_DS_CC, P=P, Q=Q, Channel=Channel, ocean=BoundaryCondition,
+                                             H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path, FactorCal=True)
+            else:
+                Comando = CommandFastFlood("Run",
+                                           FastFloodPath, customurl=customurl,
+                                           DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
+                                           SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, D_DS_CC=D_DS_CC, P=P, Q=Q, Channel=Channel,
+                                           ocean=BoundaryCondition,
+                                           H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path,
+                                           FactorCal=True)
 
         #'''
         # Ejecutar comando
-        ExeFastFlood(Comando,log)
+        if StatusExe:
+            ExeFastFlood(Comando,log)
 
-        # Recortar el raster al shapefile de la cuenca
-        ClicRasterWithBasin(H_Path_Tmp, BasinPath, salida=H_Path)
-        ClicRasterWithBasin(V_Path_Tmp, BasinPath, salida=V_Path)
-        ClicRasterWithBasin(Q_Path_Tmp, BasinPath, salida=Q_Path)
+            # Recortar el raster al shapefile de la cuenca
+            ClicRasterWithBasin(H_Path_Tmp, BasinPath, salida=H_Path)
+            ClicRasterWithBasin(V_Path_Tmp, BasinPath, salida=V_Path)
+            ClicRasterWithBasin(Q_Path_Tmp, BasinPath, salida=Q_Path)
         #'''
 
     # Guardar Listado de Raster de Profundidad
@@ -600,32 +847,52 @@ def RunScenarios(ProjectPath, FastFloodPath, D, P, Q, SSP, TR,
                 log.write(f"# Execution FastFlood | Scenario: BaU | Climate: Historic | TR: {TR_i} | Duration: {D} \n")
                 log.write("# ---------------------------------------------------------------------------------------------------\n")
 
-            Comando = CommandFastFlood("Run",
-                                       FastFloodPath, customurl=customurl,
-                                       DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
-                                       SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, Channel=Channel, ocean=BoundaryCondition,
-                                       H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path, FactorCal=True)
+            if IDF_Table is not None:
+                ValueStorm = IDF_Table.loc[D_DS, TR_i]
+                Comando = CommandFastFlood("Run",
+                                           FastFloodPath, customurl=customurl,
+                                           DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
+                                           SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, Rain=ValueStorm, Channel=Channel, ocean=BoundaryCondition,
+                                           H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path, FactorCal=True)
+            else:
+                Comando = CommandFastFlood("Run",
+                                           FastFloodPath, customurl=customurl,
+                                           DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
+                                           SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, Channel=Channel, ocean=BoundaryCondition,
+                                           H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path,
+                                           FactorCal=True)
 
         else:
             if log is not None:
                 log.write("# ---------------------------------------------------------------------------------------------------\n")
                 log.write(f"# Execution FastFlood | Scenario: Bau | Climate : {SSP} | Period: {P} | Quantile: {Q} | TR: {TR_i} | Duration: {D} \n")
                 log.write("# ---------------------------------------------------------------------------------------------------\n")
+            if IDF_Table is not None:
+                ValueStorm = IDF_Table.loc[D_DS, TR_i]
+                Comando = CommandFastFlood("Run",
+                                           FastFloodPath, customurl=customurl,
+                                           DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
+                                           SSP=SSP, TR=TR_i, D=D, D_DS=D_DS,Rain=ValueStorm, D_DS_CC=D_DS_CC, P=P, Q=Q, Channel=Channel, ocean=BoundaryCondition,
+                                           H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path, FactorCal=True)
+            else:
+                Comando = CommandFastFlood("Run",
+                                           FastFloodPath, customurl=customurl,
+                                           DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
+                                           SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, D_DS_CC=D_DS_CC, P=P, Q=Q, Channel=Channel,
+                                           ocean=BoundaryCondition,
+                                           H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path,
+                                           FactorCal=True)
 
-            Comando = CommandFastFlood("Run",
-                                       FastFloodPath, customurl=customurl,
-                                       DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
-                                       SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, D_DS_CC=D_DS_CC, P=P, Q=Q, Channel=Channel, ocean=BoundaryCondition,
-                                       H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path, FactorCal=True)
 
         #'''
         # Ejecutar comando
-        ExeFastFlood(Comando,log)
+        if StatusExe:
+            ExeFastFlood(Comando,log)
 
-        # Recortar el raster al shapefile de la cuenca
-        ClicRasterWithBasin(H_Path_Tmp, BasinPath, salida=H_Path)
-        ClicRasterWithBasin(V_Path_Tmp, BasinPath, salida=V_Path)
-        ClicRasterWithBasin(Q_Path_Tmp, BasinPath, salida=Q_Path)
+            # Recortar el raster al shapefile de la cuenca
+            ClicRasterWithBasin(H_Path_Tmp, BasinPath, salida=H_Path)
+            ClicRasterWithBasin(V_Path_Tmp, BasinPath, salida=V_Path)
+            ClicRasterWithBasin(Q_Path_Tmp, BasinPath, salida=Q_Path)
         #'''
 
     # Guardar Listado de Raster de Profundidad
@@ -662,37 +929,59 @@ def RunScenarios(ProjectPath, FastFloodPath, D, P, Q, SSP, TR,
                 log.write(f"# Execution FastFlood | Scenario: NbS | Climate: Historic | TR: {TR_i} | Duration: {D} \n")
                 log.write("# ---------------------------------------------------------------------------------------------------\n")
 
-            Comando = CommandFastFlood("Run",
-                                       FastFloodPath, customurl=customurl,
-                                       DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
-                                       SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, Channel=Channel, ocean=BoundaryCondition,
-                                       H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path, FactorCal=True)
+            if IDF_Table is not None:
+                ValueStorm = IDF_Table.loc[D_DS, TR_i]
+                Comando = CommandFastFlood("Run",
+                                           FastFloodPath, customurl=customurl,
+                                           DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
+                                           SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, Rain=ValueStorm, Channel=Channel, ocean=BoundaryCondition,
+                                           H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path, FactorCal=True)
+            else:
+                Comando = CommandFastFlood("Run",
+                                           FastFloodPath, customurl=customurl,
+                                           DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
+                                           SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, Channel=Channel, ocean=BoundaryCondition,
+                                           H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path,
+                                           FactorCal=True)
+
         else:
             if log is not None:
                 log.write("# ---------------------------------------------------------------------------------------------------\n")
                 log.write(f"# Execution FastFlood | Scenario: NbS | Climate: {SSP} | Period: {P} | Quantile: {Q} | TR: {TR_i} | Duration: {D} \n")
                 log.write("# ---------------------------------------------------------------------------------------------------\n")
 
-            Comando = CommandFastFlood("Run",
-                                       FastFloodPath, customurl=customurl,
-                                       DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
-                                       SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, D_DS_CC=D_DS_CC, P=P, Q=Q, Channel=Channel, ocean=BoundaryCondition,
-                                       H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path, FactorCal=True)
+            if IDF_Table is not None:
+                ValueStorm = IDF_Table.loc[D_DS, TR_i]
+                Comando = CommandFastFlood("Run",
+                                           FastFloodPath, customurl=customurl,
+                                           DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
+                                           SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, Rain=ValueStorm, D_DS_CC=D_DS_CC, P=P, Q=Q, Channel=Channel, ocean=BoundaryCondition,
+                                           H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path, FactorCal=True)
+            else:
+                Comando = CommandFastFlood("Run",
+                                           FastFloodPath, customurl=customurl,
+                                           DEM_Path=DEM_Path, Manning_Path=Manning_Path, Inf_Path=Inf_Path,
+                                           SSP=SSP, TR=TR_i, D=D, D_DS=D_DS, D_DS_CC=D_DS_CC, P=P, Q=Q, Channel=Channel,
+                                           ocean=BoundaryCondition,
+                                           H_Path=H_Path_Tmp, Q_Path=Q_Path_Tmp, V_Path=V_Path_Tmp, TS_Path=TS_Q_Path,
+                                           FactorCal=True)
 
         #'''
         # Ejecutar comando
-        ExeFastFlood(Comando,log)
+        if StatusExe:
+            ExeFastFlood(Comando,log)
 
-        # Recortar el raster al shapefile de la cuenca
-        ClicRasterWithBasin(H_Path_Tmp, BasinPath, salida=H_Path)
-        ClicRasterWithBasin(V_Path_Tmp, BasinPath, salida=V_Path)
-        ClicRasterWithBasin(Q_Path_Tmp, BasinPath, salida=Q_Path)
+            # Recortar el raster al shapefile de la cuenca
+            ClicRasterWithBasin(H_Path_Tmp, BasinPath, salida=H_Path)
+            ClicRasterWithBasin(V_Path_Tmp, BasinPath, salida=V_Path)
+            ClicRasterWithBasin(Q_Path_Tmp, BasinPath, salida=Q_Path)
         #'''
 
     # Guardar Listado de Raster de Profundidad
     Results['H']['NbS'] = raster_paths_H
     Results['V']['NbS'] = raster_paths_V
     Results['Q']['NbS'] = raster_paths_Q
+    log.flush()
 
     return Results
 
@@ -708,51 +997,6 @@ def ReadDamageCurve(ProjectPath):
     DC          = FacCurve.mul(MaxCost.iloc[0])
 
     return DC
-
-def TR_Damage_Old(df_profundidad, df_costos, category='Residential'):
-    """
-    Interpola/Extrapola los costos para la categoría en función de las profundidades.
-
-    Parámetros:
-    -----------
-    df_profundidad: DataFrame
-        DataFrame con columnas de periodos de retorno (TR) y filas de ubicaciones/escenarios.
-        Ejemplo:
-                   TR_2      TR_5     TR_10  ...    TR_1000
-            0     0.000031  0.000041  0.000048  ...  0.000133
-            1     0.000088  0.000133  0.000155  ...  0.000417
-
-    df_costos: DataFrame
-        DataFrame con profundidades como índice y costos por categoría.
-        Ejemplo:
-                  Residential  Commercial  ...  Agriculture
-            Flood depth [m]
-            0.0            0.0         0.0  ...          0.0
-            0.5            0.32        0.32 ...          0.32
-
-    Retorna:
-    --------
-    Dict[str, DataFrame]
-        Diccionario con DataFrames de costos interpolados para cada categoría.
-        Cada DataFrame tiene la misma estructura que df_profundidad.
-    """
-
-    # Extraer datos de profundidad (x) y costos (y) de la categoría
-    x = df_costos.index.to_numpy().astype(float)  # Profundidades conocidas
-    y = df_costos[category].to_numpy().astype(float)  # Costos conocidos
-
-    # Ordenar los datos por profundidad (necesario para interp1d)
-    sorted_idx  = np.argsort(x)
-    x_sorted    = x[sorted_idx]
-    y_sorted    = y[sorted_idx]
-
-    # Crear función de interpolación lineal con extrapolación
-    interpolador = interp1d(x_sorted, y_sorted,
-                            kind='linear',
-                            fill_value='extrapolate')
-
-    # Aplicar interpolación a todo el DataFrame de profundidades
-    return df_profundidad.applymap(lambda val: interpolador(val))
 
 def TR_Damage(df_profundidad, df_costos, category='Residential'):
     """
@@ -801,6 +1045,9 @@ def TR_Damage(df_profundidad, df_costos, category='Residential'):
 
     # Aplicar la interpolación vectorizada al array de profundidades
     valores_interpolados = interpolador(df_profundidad.values)
+
+    # Seguro de maximo 1.0
+    valores_interpolados[valores_interpolados > 1.0] = 1.0
 
     # Reconstruir DataFrame con los mismos índices y columnas
     return pd.DataFrame(valores_interpolados,
@@ -865,7 +1112,7 @@ def DesaggregationData(Data, NameCol, NBS, Time):
 
     # Calcular
     NBS_Year    = np.cumsum(np.sum(NBS[:, 2:], 0))
-    NBS_Year    = np.concatenate([np.array([0]), NBS_Year, np.repeat(NBS_Year[-1], Time - 3)])
+    NBS_Year    = np.concatenate([np.array([0]), NBS_Year, np.repeat(NBS_Year[-1], Time - len(NBS_Year))])
     Factor      = NBS_Year / np.sum(NBS_Total)
 
     # Parámetro r de la función logística
@@ -1164,7 +1411,7 @@ def ROI_FastFlood(PathProject_ROI):
     ROI.to_csv(os.path.join(PathProject_ROI, OUTPUTS, '11_ROI_Sensitivity.csv'))
     NPV.to_csv(os.path.join(PathProject_ROI, OUTPUTS, '12_NPV.csv'))
 
-def Raster2Zonal(profundidades, shapefile_mascara=None, Threshold_H=0.01):
+def Raster2Zonal_Old(profundidades, shapefile_mascara=None, Threshold_H=0.01):
     """
     Extrae y resume estadísticas básicas de uno o varios rásteres de profundidad,
     limitando opcionalmente por un shapefile en WGS84.
@@ -1243,42 +1490,331 @@ def Raster2Zonal(profundidades, shapefile_mascara=None, Threshold_H=0.01):
 
     return pd.DataFrame(registros)
 
-def Raster2DataFrame_Damages(ruta_cobertura, profundidades, codigos_cobertura, shapefile_mascara=None, Threshold_H=0.01):
+def Raster2Zonal(profundidades, shapefile_mascara=None, Threshold_H=0.01):
+    """
+    Extrae y resume estadísticas básicas de uno o varios rásteres de profundidad,
+    limitando opcionalmente por un shapefile en WGS84.
+
+    Esta función optimizada utiliza técnicas de procesamiento eficiente incluyendo:
+    - Lectura por bloques para manejo óptimo de memoria
+    - Operaciones vectorizadas de NumPy
+    - Uso de rasterio.mask para aplicación directa de geometrías
+    - Lectura por ventanas cuando se aplica máscara espacial
+
+    Parámetros
+    ----------
+    profundidades : str o dict
+        Ruta a un solo ráster o diccionario {nombre_columna: ruta_raster}.
+        Los rásteres deben contener valores de profundidad de inundación.
+
+    shapefile_mascara : str, opcional
+        Ruta a shapefile en WGS84 que define el área de análisis.
+        Si se proporciona, el análisis se limitará a esta geometría.
+        Por defecto None (analiza todo el ráster).
+
+    Threshold_H : float, opcional
+        Valor mínimo de profundidad para conservar en metros.
+        Valores menores se consideran como 0 (sin inundación).
+        Por defecto 0.01 metros.
+
+    Retorna
+    -------
+    pd.DataFrame
+        DataFrame con estadísticas por capa que incluye:
+        - 'TR': Nombre de la capa/período de retorno
+        - 'Maximum Flood Depth [m]': Profundidad máxima de inundación
+        - 'Peak Descharge [m3/s]': Caudal pico (siempre 0.0)
+        - 'Flood Area [ha]': Área inundada en hectáreas
+
+    Raises
+    ------
+    ValueError
+        Si el shapefile no contiene geometría válida.
+        Si los archivos de ráster no se pueden abrir.
+
+    Ejemplos
+    --------
+    >>> # Análisis de un solo ráster
+    >>> resultado = Raster2Zonal('profundidad_tr100.tif')
+
+    >>> # Análisis de múltiples rásteres con máscara
+    >>> rasteres = {
+    ...     'TR_10': 'profundidad_tr10.tif',
+    ...     'TR_100': 'profundidad_tr100.tif'
+    ... }
+    >>> resultado = Raster2Zonal(rasteres, 'zona_estudio.shp', Threshold_H=0.05)
+
+    Notas
+    -----
+    - Los rásteres deben estar en el mismo sistema de coordenadas
+    - La función reprojectará automáticamente el shapefile al CRS del ráster
+    - Para rásteres muy grandes, la función utiliza procesamiento por bloques
+    - El campo 'Peak Descharge' siempre retorna 0.0 (placeholder para compatibilidad)
+    """
+
+    print("🚀 Iniciando análisis Raster2Zonal optimizado...")
+    inicio_total = time.time()
+
+    # Normalizar entrada a diccionario
+    if isinstance(profundidades, str):
+        profundidades = {'Profundidad': profundidades}
+        print(f"📁 Procesando un solo ráster: {os.path.basename(profundidades['Profundidad'])}")
+    else:
+        print(f"📁 Procesando {len(profundidades)} rásteres: {list(profundidades.keys())}")
+
+    # Obtener información del primer ráster como referencia
+    print("🔍 Analizando ráster de referencia...")
+    primera_ruta = list(profundidades.values())[0]
+
+    try:
+        with rasterio.open(primera_ruta) as ref_raster:
+            crs_objetivo = ref_raster.crs
+            shape = ref_raster.shape
+            transform = ref_raster.transform
+            pixel_area_m2 = abs(transform.a * transform.e)
+            print(f"   • CRS: {crs_objetivo}")
+            print(f"   • Dimensiones: {shape[1]} x {shape[0]} píxeles")
+            print(f"   • Área por píxel: {pixel_area_m2:.2f} m²")
+    except Exception as e:
+        raise ValueError(f"Error al leer ráster de referencia: {e}")
+
+    # Procesar shapefile de máscara si se proporciona
+    geometrias_mask = None
+    usar_ventana = False
+
+    if shapefile_mascara:
+        print(f"🗺️  Procesando máscara espacial: {os.path.basename(shapefile_mascara)}")
+        try:
+            gdf = gpd.read_file(shapefile_mascara)
+            if 'geometry' not in gdf or gdf.geometry.isna().all():
+                raise ValueError("El shapefile no contiene geometría válida.")
+
+            print(f"   • Geometrías originales: {len(gdf)} en CRS {gdf.crs}")
+
+            # Reproyectar si es necesario
+            if gdf.crs != crs_objetivo:
+                print("   • Reproyectando geometrías al CRS del ráster...")
+                gdf = gdf.to_crs(crs_objetivo)
+
+            geometrias_mask = gdf.geometry.values
+            usar_ventana = True
+            print("   • Máscara espacial configurada correctamente")
+
+        except Exception as e:
+            raise ValueError(f"Error al procesar shapefile: {e}")
+    else:
+        print("📊 Sin máscara espacial - analizando ráster completo")
+
+    # Procesar cada ráster
+    registros = []
+
+    for i, (nombre_columna, ruta) in enumerate(profundidades.items(), 1):
+        print(f"\n🔄 Procesando ráster {i}/{len(profundidades)}: {nombre_columna}")
+        inicio_raster = time.time()
+
+        try:
+            with rasterio.open(ruta) as src:
+                # Verificar compatibilidad
+                if src.crs != crs_objetivo or src.transform != transform or src.shape != shape:
+                    print("   ⚠️  Ráster con diferente proyección/resolución - continuando con precaución")
+
+                # Estrategia optimizada: usar rasterio.mask si hay geometrías
+                if geometrias_mask is not None:
+                    print("   🎯 Aplicando máscara geométrica...")
+
+                    # Usar rasterio.mask para aplicar geometrías directamente
+                    masked_data, masked_transform = rasterio.mask.mask(
+                        src, geometrias_mask, crop=True, nodata=0
+                    )
+                    data = masked_data[0]  # Primera banda
+
+                    print(f"   • Datos enmascarados: {data.shape} píxeles")
+
+                else:
+                    print("   📖 Leyendo ráster completo...")
+                    data = src.read(1)  # Leer toda la primera banda
+
+                print(f"   • Datos cargados: {data.size:,} píxeles")
+
+        except Exception as e:
+            print(f"   ❌ Error al leer ráster: {e}")
+            # Crear registro con valores por defecto para mantener compatibilidad
+            registros.append({
+                'TR': nombre_columna,
+                'Maximum Flood Depth [m]': np.nan,
+                'Peak Descharge [m3/s]': 0.0,
+                'Flood Area [ha]': 0.0,
+            })
+            continue
+
+        # Aplicar threshold de manera vectorizada
+        print(f"   🔢 Aplicando threshold ({Threshold_H} m)...")
+
+        # Operación vectorizada ultrarrápida
+        mask_validos = (data >= Threshold_H) & (~np.isnan(data)) & (data != 0)
+        valores_validos = data[mask_validos]
+
+        if len(valores_validos) == 0:
+            print(f"   ⚠️  Sin valores válidos para: {nombre_columna}")
+            estadisticas = {
+                'TR': nombre_columna,
+                'Maximum Flood Depth [m]': np.nan,
+                'Peak Descharge [m3/s]': 0.0,
+                'Flood Area [ha]': 0.0,
+            }
+        else:
+            # Cálculos vectorizados
+            area_total_ha = (len(valores_validos) * pixel_area_m2) / 10000.0
+            max_depth = float(np.max(valores_validos))
+
+            estadisticas = {
+                'TR': nombre_columna,
+                'Maximum Flood Depth [m]': max_depth,
+                'Peak Descharge [m3/s]': 0.0,  # Placeholder para compatibilidad
+                'Flood Area [ha]': area_total_ha,
+            }
+
+            print(f"   ✅ Profundidad máxima: {max_depth:.3f} m")
+            print(f"   ✅ Área inundada: {area_total_ha:.2f} ha")
+            print(f"   ✅ Píxeles válidos: {len(valores_validos):,}")
+
+        registros.append(estadisticas)
+
+        tiempo_raster = time.time() - inicio_raster
+        print(f"   ⏱️  Tiempo de procesamiento: {tiempo_raster:.2f}s")
+
+    # Crear DataFrame resultado
+    resultado = pd.DataFrame(registros)
+
+    tiempo_total = time.time() - inicio_total
+    print(f"\n🎉 Análisis completado exitosamente!")
+    print(f"⏱️  Tiempo total: {tiempo_total:.2f}s")
+    print(f"📊 Registros generados: {len(resultado)}")
+
+    resultado = resultado.fillna(0)
+    return resultado
+
+def Raster2DataFrame_Damages(ruta_cobertura, profundidades, codigos_cobertura, shapefile_mascara=None, Threshold_H=0.01,
+                             verbose=True):
     """
     Extrae profundidades de uno o varios rásteres en las coordenadas de cobertura seleccionadas,
     limitando opcionalmente con un shapefile de máscara en WGS84.
 
-    Parámetros:
-        ruta_cobertura (str): Ruta al ráster de cobertura.
-        profundidades (str | dict): Ruta a un solo ráster o diccionario {nombre_columna: ruta}.
-        codigos_cobertura (list): Lista de códigos de cobertura deseados.
-        shapefile_mascara (str, opcional): Ruta a shapefile para limitar el análisis.
-        Threshold_H (float, opcional): Umbral mínimo de profundidad.
+    Esta función permite analizar múltiples escenarios de inundación extrayendo valores de profundidad
+    del mismo píxel espacial desde diferentes rásteres. Cada fila del DataFrame resultante representa
+    un píxel válido con su código de cobertura y los valores de profundidad correspondientes.
 
-    Retorna:
-        pd.DataFrame: Con columnas ['Code', <una o varias columnas de profundidad>]
+    Parameters
+    ----------
+    ruta_cobertura : str
+        Ruta al archivo ráster de cobertura del suelo que define los tipos de uso.
+        Este ráster se usa como referencia espacial (CRS, transformación, dimensiones).
+    profundidades : str or dict
+        Si es str: ruta a un solo ráster de profundidad.
+        Si es dict: diccionario con formato {nombre_columna: ruta_raster}.
+        Cada ráster será reproyectado y remuestreado al grid del ráster de cobertura.
+    codigos_cobertura : list of int
+        Lista de códigos numéricos de cobertura a incluir en el análisis.
+        Solo se extraerán valores de píxeles que contengan estos códigos.
+    shapefile_mascara : str, optional
+        Ruta a shapefile (.shp) para limitar espacialmente el análisis.
+        El shapefile será reproyectado al CRS del ráster de cobertura.
+        Si es None, se analizará toda el área del ráster de cobertura.
+    Threshold_H : float, optional
+        Umbral mínimo de profundidad en metros. Valores menores se establecen a 0.
+        Default: 0.01 metros.
+    verbose : bool, optional
+        Si True, muestra mensajes informativos del progreso del procesamiento.
+        Default: False.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame con las siguientes columnas:
+        - 'Code': Código de cobertura del píxel
+        - Una columna por cada ráster de profundidad con el nombre especificado
+        Cada fila representa un píxel válido donde al menos una profundidad > 0.
+
+    Examples
+    --------
+    >>> # Análisis con un solo ráster
+    >>> df = Raster2DataFrame_Damages(
+    ...     ruta_cobertura='cobertura.tif',
+    ...     profundidades='inundacion_t10.tif',
+    ...     codigos_cobertura=[21, 22, 23]
+    ... )
+
+    >>> # Análisis con múltiples rásteres
+    >>> rasters_prof = {
+    ...     'T10': 'inundacion_t10.tif',
+    ...     'T50': 'inundacion_t50.tif',
+    ...     'T100': 'inundacion_t100.tif'
+    ... }
+    >>> df = Raster2DataFrame_Damages(
+    ...     ruta_cobertura='cobertura.tif',
+    ...     profundidades=rasters_prof,
+    ...     codigos_cobertura=[21, 22, 23],
+    ...     shapefile_mascara='zona_estudio.shp',
+    ...     verbose=True
+    ... )
+
+    Notes
+    -----
+    - Todos los rásteres de profundidad son reproyectados al CRS del ráster de cobertura
+    - Se usa remuestreo 'nearest neighbor' para mantener valores exactos
+    - Los píxeles donde todas las profundidades son 0 se eliminan del resultado
+    - La función asume que el ráster de cobertura tiene valores enteros como códigos
+
+    Raises
+    ------
+    ValueError
+        Si el shapefile_mascara no es válido o no contiene geometría.
+    FileNotFoundError
+        Si alguna de las rutas de rásteres no existe.
     """
+    if verbose:
+        print("Iniciando procesamiento de rásteres de daños por inundación...")
+        print(f"Ráster de cobertura: {ruta_cobertura}")
+
     if isinstance(profundidades, str):
         profundidades = {'Profundidad': profundidades}
+        if verbose:
+            print(f"Procesando 1 ráster de profundidad: {profundidades['Profundidad']}")
+    else:
+        if verbose:
+            print(f"Procesando {len(profundidades)} rásteres de profundidad:")
+            for nombre, ruta in profundidades.items():
+                print(f"  - {nombre}: {ruta}")
 
     # Abrir ráster de cobertura y guardar su CRS, shape y transform
+    if verbose:
+        print("Leyendo ráster de cobertura...")
     with rasterio.open(ruta_cobertura) as src_cov:
         crs_objetivo = src_cov.crs
         transform = src_cov.transform
         shape = src_cov.shape
         cov_data = src_cov.read(1)
+        if verbose:
+            print(f"  - CRS: {crs_objetivo}")
+            print(f"  - Dimensiones: {shape[1]} x {shape[0]} píxeles")
 
     # Leer shapefile de máscara (opcional)
     geometria_mask = None
     if shapefile_mascara:
+        if verbose:
+            print(f"Procesando shapefile de máscara: {shapefile_mascara}")
         gdf = gpd.read_file(shapefile_mascara)
         if not isinstance(gdf, gpd.GeoDataFrame) or 'geometry' not in gdf:
             raise ValueError("El archivo proporcionado no es un shapefile válido con geometría.")
         gdf = gdf.to_crs(crs_objetivo)
         geometria_mask = gdf.geometry
+        if verbose:
+            print(f"  - Shapefile reproyectado a {crs_objetivo}")
 
     # Generar máscara espacial si hay geometría
     if geometria_mask is not None and geometria_mask.notna().any():
+        if verbose:
+            print("Creando máscara espacial...")
         mascara_geo = geometry_mask(
             geometries=geometria_mask,
             transform=transform,
@@ -1287,8 +1823,12 @@ def Raster2DataFrame_Damages(ruta_cobertura, profundidades, codigos_cobertura, s
         )
     else:
         mascara_geo = np.ones(shape, dtype=bool)
+        if verbose:
+            print("Sin máscara espacial - procesando toda el área")
 
     # Máscara por códigos de cobertura
+    if verbose:
+        print(f"Aplicando filtro por códigos de cobertura: {codigos_cobertura}")
     mascara_cod = np.isin(cov_data, codigos_cobertura)
     mascara_total = mascara_cod & mascara_geo
 
@@ -1296,123 +1836,59 @@ def Raster2DataFrame_Damages(ruta_cobertura, profundidades, codigos_cobertura, s
     filas, columnas = np.where(mascara_total)
     valores_cobertura = cov_data[filas, columnas]
 
-    # Coordenadas X, Y para exportar o validación (no usadas en extracción ahora)
-    # coords = list(zip(*xy(transform, filas, columnas)))
+    if verbose:
+        print(f"Píxeles válidos encontrados: {len(filas):,}")
+        codigo_counts = pd.Series(valores_cobertura).value_counts().sort_index()
+        print("Distribución por código de cobertura:")
+        for codigo, count in codigo_counts.items():
+            print(f"  - Código {codigo}: {count:,} píxeles")
 
     # DataFrame base
     df = pd.DataFrame({'Code': valores_cobertura})
 
     # Cargar cada capa de profundidad reproyectada y remuestreada al grid del ráster de cobertura
-    for nombre_columna, ruta in profundidades.items():
+    for i, (nombre_columna, ruta) in enumerate(profundidades.items(), 1):
+        if verbose:
+            print(f"Procesando ráster {i}/{len(profundidades)}: {nombre_columna}")
+
         with rasterio.open(ruta) as src_prof:
             with WarpedVRT(
-                src_prof,
-                crs=crs_objetivo,
-                transform=transform,
-                width=shape[1],
-                height=shape[0],
-                resampling=Resampling.nearest
+                    src_prof,
+                    crs=crs_objetivo,
+                    transform=transform,
+                    width=shape[1],
+                    height=shape[0],
+                    resampling=Resampling.nearest
             ) as vrt_prof:
                 prof_data = vrt_prof.read(1)  # solo banda 1
                 valores_prof = prof_data[filas, columnas]
                 df[nombre_columna] = valores_prof
 
+                if verbose:
+                    stats = pd.Series(valores_prof)
+                    print(f"  - Rango de valores: {stats.min():.3f} - {stats.max():.3f}")
+                    print(f"  - Valores > {Threshold_H}: {(stats > Threshold_H).sum():,} píxeles")
+
     # Aplicar threshold a columnas de profundidad
+    if verbose:
+        print(f"Aplicando umbral mínimo de profundidad: {Threshold_H} m")
     columnas_prof = list(profundidades.keys())
     for col in columnas_prof:
         df[col] = np.where(df[col] < Threshold_H, 0, df[col])
 
     # Eliminar filas donde todas las profundidades son cero
+    filas_iniciales = len(df)
     df = df[df[columnas_prof].sum(axis=1) != 0]
 
-    return df
-
-def Raster2DataFrame_Damages_Old(ruta_cobertura, profundidades, codigos_cobertura, shapefile_mascara=None, Threshold_H=0.01):
-    """
-    Extrae profundidades de uno o varios rásteres en las coordenadas de cobertura seleccionadas,
-    limitando opcionalmente con un shapefile de máscara en WGS84.
-
-    Parámetros:
-        ruta_cobertura (str): Ruta al ráster de cobertura.
-        profundidades (str | dict): Ruta a un solo ráster o diccionario {nombre_columna: ruta}.
-        codigos_cobertura (list): Lista de códigos de cobertura deseados.
-        shapefile_mascara (str, opcional): Ruta a shapefile para limitar el análisis.
-
-    Retorna:
-        pd.DataFrame: Con columnas ['Cobertura', <una o varias columnas de profundidad>]
-    """
-
-    # Establecer el CRS objetivo a partir del primer ráster de profundidad
-    if isinstance(profundidades, str):
-        profundidades = {'Profundidad': profundidades}
-
-    primera_ruta = list(profundidades.values())[0]
-    with rasterio.open(primera_ruta) as ref_raster:
-        crs_objetivo = ref_raster.crs
-
-    # Leer shapefile si se proporciona
-    geometria_mask = None
-    if shapefile_mascara:
-        gdf = gpd.read_file(shapefile_mascara)
-
-        if not isinstance(gdf, gpd.GeoDataFrame) or 'geometry' not in gdf:
-            raise ValueError("El archivo proporcionado no es un shapefile válido con geometría.")
-
-        gdf = gdf.to_crs(crs_objetivo)  # reproyectar
-        geometria_mask = gdf.geometry
-
-    # Abrir ráster de cobertura
-    with rasterio.open(ruta_cobertura) as src_cov:
-        if src_cov.crs != crs_objetivo:
-            vrt_cov = WarpedVRT(src_cov, crs=crs_objetivo, resampling=Resampling.nearest)
-        else:
-            vrt_cov = WarpedVRT(src_cov)
-
-        with vrt_cov:
-            cov_data = vrt_cov.read(1)
-            transform = vrt_cov.transform
-            shape = cov_data.shape
-
-            # Máscara por geometría si se dio shapefile
-            if geometria_mask is not None and geometria_mask.notna().any():
-                mascara_geo = geometry_mask(
-                    geometries=geometria_mask,
-                    transform=transform,
-                    invert=True,
-                    out_shape=shape
-                )
-            else:
-                mascara_geo = np.ones(shape, dtype=bool)  # sin restricción espacial
-
-            # Máscara por códigos de cobertura
-            mascara_cod = np.isin(cov_data, codigos_cobertura)
-
-            # Combinar máscaras
-            mascara_total = mascara_cod & mascara_geo
-
-            filas, columnas = np.where(mascara_total)
-            coords = list(zip(*xy(transform, filas, columnas)))
-            valores_cobertura = cov_data[filas, columnas]
-
-    # DataFrame base
-    df = pd.DataFrame({'Code': valores_cobertura})
-
-    # Agregar capas de profundidad
-    for nombre_columna, ruta in profundidades.items():
-        with rasterio.open(ruta) as src_prof:
-            with WarpedVRT(src_prof, resampling=Resampling.nearest) as vrt_prof:
-                valores_prof = list(vrt_prof.sample(coords))
-                valores_prof = np.array(valores_prof).flatten()
-                df[nombre_columna] = valores_prof
-
-    # Aplicar Threshold de alturas si existe
-    n = profundidades.keys().__len__()
-    df[df < Threshold_H] = 0
-    df = df[df.iloc[:, 1:n].sum(axis=1) != 0]
+    if verbose:
+        print(f"Filas eliminadas (todas profundidades = 0): {filas_iniciales - len(df):,}")
+        print(f"DataFrame final: {len(df):,} filas × {len(df.columns)} columnas")
+        print("Procesamiento completado exitosamente.")
 
     return df
 
-def Clic_Mosaic_DataBase(carpeta_tiles, aoi_path, ruta_salida, crs_salida=None,simplificar_aoi=None,verbose=True):
+def Clic_Mosaic_DataBase(carpeta_tiles, aoi_path, ruta_salida, crs_salida=None, simplificar_aoi=None,
+                         recorte_exacto=True, verbose=True):
     """
        Genera un mosaico raster recortado a un Área de Interés (AOI) a partir de una carpeta de tiles raster.
 
@@ -1433,6 +1909,10 @@ def Clic_Mosaic_DataBase(carpeta_tiles, aoi_path, ruta_salida, crs_salida=None,s
        simplificar_aoi : float, opcional
            Tolerancia para simplificar la geometría del AOI (en unidades del CRS del AOI).
 
+       recorte_exacto : bool, opcional
+           Si True, recorta el mosaico con la forma exacta del shapefile.
+           Si False, mantiene el recorte rectangular (comportamiento por defecto).
+
        verbose : bool
            Si True, imprime mensajes de avance y tiempos de ejecución.
 
@@ -1450,16 +1930,23 @@ def Clic_Mosaic_DataBase(carpeta_tiles, aoi_path, ruta_salida, crs_salida=None,s
             crs_aoi = CRS.from_wkt(src.crs_wkt)
             geometries = [shape(f["geometry"]) for f in src]
         geom_union = unary_union(geometries)
+        # Guardar la geometría original para el recorte exacto
+        geom_original = geom_union
     elif ext in [".tif", ".tiff"]:
         with rasterio.open(aoi_path) as src:
             crs_aoi = CRS(src.crs)
             bounds = src.bounds
             geom_union = box(*bounds)
+            # Para rasters, la geometría original es la misma que la union
+            geom_original = geom_union
     else:
         raise ValueError("AOI debe ser shapefile o ráster")
 
     if simplificar_aoi:
         geom_union = geom_union.simplify(simplificar_aoi)
+        # Si se simplifica, también actualizar la geometría original si se va a usar recorte exacto
+        if recorte_exacto:
+            geom_original = geom_union
     if verbose: print(f"A. AOI cargado en {time.perf_counter() - t0:.2f} s")
 
     # === B. Leer/crear índice CSV ===
@@ -1496,8 +1983,27 @@ def Clic_Mosaic_DataBase(carpeta_tiles, aoi_path, ruta_salida, crs_salida=None,s
         coords = list(geom_union.exterior.coords)
         coords_proj = [transformer.transform(x, y) for x, y in coords]
         geom_proj = box(*shape({'type': 'Polygon', 'coordinates': [coords_proj]}).bounds)
+
+        # Reproyectar también la geometría original si se va a usar recorte exacto
+        if recorte_exacto:
+            if geom_original.geom_type == 'Polygon':
+                coords_orig = list(geom_original.exterior.coords)
+                coords_orig_proj = [transformer.transform(x, y) for x, y in coords_orig]
+                geom_original_proj = shape({'type': 'Polygon', 'coordinates': [coords_orig_proj]})
+            elif geom_original.geom_type == 'MultiPolygon':
+                polygons_proj = []
+                for polygon in geom_original.geoms:
+                    coords_orig = list(polygon.exterior.coords)
+                    coords_orig_proj = [transformer.transform(x, y) for x, y in coords_orig]
+                    polygons_proj.append(shape({'type': 'Polygon', 'coordinates': [coords_orig_proj]}))
+                geom_original_proj = MultiPolygon(polygons_proj)
+            else:
+                geom_original_proj = geom_original
+        else:
+            geom_original_proj = None
     else:
         geom_proj = geom_union
+        geom_original_proj = geom_original if recorte_exacto else None
     if verbose: print(f"C. Reproyección AOI en {time.perf_counter() - t0:.2f} s")
 
     # === D. Filtrar tiles ===
@@ -1508,7 +2014,7 @@ def Clic_Mosaic_DataBase(carpeta_tiles, aoi_path, ruta_salida, crs_salida=None,s
         (bbox_df["este"] > minx) &
         (bbox_df["sur"] < maxy) &
         (bbox_df["norte"] > miny)
-    ]
+        ]
     if bbox_df_filt.empty:
         raise RuntimeError("❌ Ningún tile intersecta el AOI")
     if verbose: print(f"D. Tiles filtrados: {len(bbox_df_filt)} en {time.perf_counter() - t0:.2f} s")
@@ -1551,6 +2057,40 @@ def Clic_Mosaic_DataBase(carpeta_tiles, aoi_path, ruta_salida, crs_salida=None,s
         "width": mosaic.shape[2],
         "transform": transform
     })
+
+    # === F.1 Aplicar recorte exacto si se especifica ===
+    if recorte_exacto and geom_original_proj is not None:
+        if verbose: print(f"F.1. Aplicando recorte exacto...")
+        t1 = time.perf_counter()
+
+        # Crear un dataset temporal en memoria para aplicar la máscara
+        temp_meta = meta_final.copy()
+        temp_meta.update({"crs": crs_tiles})
+
+        with MemoryFile() as memfile:
+            with memfile.open(**temp_meta) as temp_ds:
+                temp_ds.write(mosaic)
+                # Aplicar la máscara con la geometría exacta
+                mosaic_masked, transform_masked = rasterio.mask.mask(
+                    temp_ds,
+                    [mapping(geom_original_proj)],
+                    crop=True,
+                    nodata=0
+                )
+
+                # Actualizar metadatos con las nuevas dimensiones
+                meta_final.update({
+                    "height": mosaic_masked.shape[1],
+                    "width": mosaic_masked.shape[2],
+                    "transform": transform_masked,
+                    "nodata": 0
+                })
+
+                mosaic = mosaic_masked
+                transform = transform_masked
+
+        if verbose: print(f"     Recorte exacto completado en {time.perf_counter() - t1:.2f} s")
+
     if crs_salida and CRS.from_user_input(crs_salida) != crs_tiles:
         meta_final.update({"crs": crs_salida})
     else:
@@ -1574,6 +2114,8 @@ def Clic_Mosaic_DataBase(carpeta_tiles, aoi_path, ruta_salida, crs_salida=None,s
     if verbose: print(f"G. Escritura en {time.perf_counter() - t0:.2f} s")
 
     print(f"⏱️ Tiempo total: {time.perf_counter() - start_total:.2f} s")
+    if recorte_exacto:
+        print("✂️ Recorte exacto aplicado con la forma del shapefile")
 
 def Join_GHSBUILT_Agricultural(raster1_path, raster2_path, salida_path, bloque_tamano=512):
     """
@@ -1633,7 +2175,6 @@ def Join_GHSBUILT_Agricultural(raster1_path, raster2_path, salida_path, bloque_t
                         dst.write(data_salida, 1, window=window)
 
     print(f"✅ Raster de salida generado (alineado y procesado en bloques): {salida_path}")
-
 
 #-----------------------------------------------------------------------------------------------------------------------
 # Códigos Infiltración y Manning - NbS y BaU
@@ -1736,22 +2277,20 @@ def generate_manning_bau(
         lulc_to_manning: Dict[int, float],
         lulc_fastflood_to_lulc_end: Dict[int, int],
         locked_categories: Set[int],
-        manning_base_path: Optional[str] = None,    # ✅ forma compatible
+        manning_base_path: Optional[str] = None,
         use_raster: bool = False
-    ):
+):
     """
     Genera el raster de Manning para el escenario BaU.
-
-    (…docstring idéntico…)
     """
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
     # ── Leer rásters principales ────────────────────────────────────────────
     with rasterio.open(lulc_raster_path) as lulc_src, \
-         rasterio.open(bau_lulc_path)   as bau_src:
+            rasterio.open(bau_lulc_path) as bau_src:
 
-        lulc_ff   = lulc_src.read(1)
-        bau_lulc  = bau_src.read(1)
+        lulc_ff = lulc_src.read(1)
+        bau_lulc = bau_src.read(1)
 
         # 1) manning_inicial ← raster o diccionario
         if use_raster and manning_base_path:
@@ -1759,8 +2298,7 @@ def generate_manning_bau(
                 manning_inicial = man_src.read(1).astype(np.float32)
         else:
             manning_inicial = np.vectorize(lulc_to_manning.get)(
-                                lulc_ff).astype(np.float32)
-
+                lulc_ff).astype(np.float32)
 
         # 2️⃣ temp Manning: inverso desde BaU → FastFlood → Manning
         man_temp = np.full_like(manning_inicial, np.nan, dtype=np.float32)
@@ -1769,7 +2307,7 @@ def generate_manning_bau(
             if code == 8:  # sparse vegetation rule
                 man_temp[mask] = 0.02
             elif code in lulc_fastflood_to_lulc_end:
-                mapped = lulc_fastflood_to_lulc_end[code]  # ← mapeo inverso Bau - to fasflood
+                mapped = lulc_fastflood_to_lulc_end[code]
                 if mapped in lulc_to_manning:
                     man_temp[mask] = lulc_to_manning[mapped]
 
@@ -1777,13 +2315,13 @@ def generate_manning_bau(
         locked_mask = np.isin(lulc_ff, list(locked_categories))
         manning_final = np.where(locked_mask, manning_inicial, np.minimum(manning_inicial, man_temp))
 
-        no_Data_mask = np.isnan(manning_final)
-        manning_final[ no_Data_mask] = manning_inicial[no_Data_mask]
-        manning_final = np.minimum(manning_final, manning_inicial )
-
-        # ❗️Asegurar que ningún valor final supere el inicial (protección contra NaNs)
-        mask_gt = manning_final > manning_inicial
-        manning_final[mask_gt] = manning_inicial[mask_gt]
+        # ✅ Versión simple y directa
+        # Manejar NaNs primero
+        no_data_mask = np.isnan(manning_final)
+        manning_final[no_data_mask] = manning_inicial[no_data_mask]
+        # Forzar el límite superior píxel por píxel
+        mask_excede = (manning_final > manning_inicial) & ~np.isnan(manning_inicial)
+        manning_final[mask_excede] = manning_inicial[mask_excede]
 
         # ── Guardar ─────────────────────────────────────────────────────────
         meta = lulc_src.meta.copy()
@@ -1840,8 +2378,12 @@ def generate_infiltracion_bau(
             for j in range(cols):
                 key = (int(lulc_wp[i, j]), int(bau_lulc[i, j]))
                 if key in infiltration_change:
-                    factor = infiltration_change[key] / 100.0
-                    infil_final[i, j] = infil_base[i, j] * (1 + factor)
+                    factor = abs(infiltration_change[key] / 100.0)
+                    if factor < 1:
+                        factor2 = (1-factor)
+                    else:
+                        factor2 = 0
+                    infil_final[i, j] = infil_base[i, j]*factor2
 
         # for i in range(rows):
         #     for j in range(cols):
@@ -1854,8 +2396,12 @@ def generate_infiltracion_bau(
             for j in range(cols):
                 key = (int(cobertura_ini[i, j]), int(bau_lulc[i, j]))
                 if cobertura_ini[i, j] != bau_lulc[i, j] and key in infiltration_change:
-                    factor = infiltration_change[key] / 100.0
-                    infil_final[i, j] = infil_base[i, j] * (1 + factor)
+                    factor = abs(infiltration_change[key] / 100.0)
+                    if factor < 1:
+                        factor2 = (1-factor)
+                    else:
+                        factor2 = 0
+                    infil_final[i, j] = infil_base[i, j]*factor2
 
         # 4️⃣  Check - El BaU no puede ser mejor que el Current
         infil_final = np.minimum(infil_final, infil_base)
@@ -1866,89 +2412,6 @@ def generate_infiltracion_bau(
 
         with rasterio.open(output_path, 'w', **meta) as dst:
             dst.write(infil_final.astype(np.float32), 1)
-
-def generate_nbs_manning_Old(
-    lulc_raster: str, # LULC FastFlood (alineado)
-    lulc_raster_r_path: str, # LULC waterproof (alineado)
-    nbs_raster: str, # Portafolio (alineado)
-    bau_raster: str, # Manning Bau (alineado)
-    output_path: str,
-    lulc_mapping: Dict[int, float],
-    lulc_fastflood_to_lulc_end: Dict[int, int],
-    locked_categories: Set[int],
-    manning_dict: Dict[Tuple[int, int], float],
-    manning_base_path: Optional[str] = None,  # ✅ forma compatible
-    use_raster: bool = False
-):
-    """Build final NbS Manning raster based on prioritized actions, respecting locked areas and improving from BaU when allowed."""
-    with rasterio.open(lulc_raster) as lulc_src, \
-        rasterio.open(lulc_raster_r_path) as lulc_src_r, \
-        rasterio.open(nbs_raster) as nbs_src, \
-        rasterio.open(bau_raster) as bau_src:
-
-        lulc_data       = lulc_src.read(1)
-        lulc_data_wp    = lulc_src_r.read(1)
-        nbs_data        = nbs_src.read(1)
-        bau_data        = bau_src.read(1)
-
-        manning     = np.full(nbs_data.shape, np.nan, dtype=np.float32)
-        flat_nbs    = nbs_data.ravel()
-        flat_lulc   = lulc_data_wp.ravel()
-        manning_out = manning.ravel()
-
-        for idx in range(flat_nbs.size):
-            key = (flat_nbs[idx], flat_lulc[idx])
-            if key in manning_dict:
-                manning_out[idx] = manning_dict[key]
-
-        # Reshape a la forma original
-        temp_data =  manning_out.reshape(nbs_data.shape)
-
-        # 1️⃣ Manning inicial desde LULC base
-        if use_raster and manning_base_path:
-            with rasterio.open(manning_base_path) as man_src:
-                manning_inicial = man_src.read(1).astype(np.float32)
-        else:
-            manning_inicial = np.vectorize(lulc_mapping.get)(
-                                lulc_data).astype(np.float32)
-
-        manning_final = manning_inicial.copy()
-
-        # 2️⃣ Máscaras lógicas
-        locked_mask = np.isin(lulc_data, list(locked_categories))
-        not_locked  = ~locked_mask
-        valid_temp  = ~np.isnan(temp_data)
-        has_nbs     = ~np.isnan(nbs_data)
-
-        # 3️⃣ Regla 1: usar temp si mejora y hay NbS
-        condition_temp_greater = (temp_data > manning_inicial) & not_locked & valid_temp & has_nbs
-        manning_final[condition_temp_greater] = temp_data[condition_temp_greater]
-
-        # 4️⃣ Regla 2: usar tabla (NbS, LULC) cuando temp no mejora pero hay NbS
-        remaining_mask = not_locked & valid_temp & ~condition_temp_greater & has_nbs
-        if np.any(remaining_mask):
-            nbs_flat            = nbs_data[remaining_mask].astype(np.uint8)
-            lulc_flat           = lulc_data[remaining_mask].astype(np.uint8)
-            base_flat           = manning_inicial[remaining_mask]
-            mapped_lulc_flat    = np.vectorize(lulc_fastflood_to_lulc_end.get)(lulc_flat)
-
-            final_values = base_flat.copy()
-            for idx, (nbs_val, lulc_val) in enumerate(zip(nbs_flat, mapped_lulc_flat)):
-                key = (nbs_val, lulc_val)
-                if key in manning_dict:
-                    final_values[idx] = manning_dict[key]
-
-            manning_final[remaining_mask] = final_values
-
-        # 5️⃣ Regla 3: donde no hay NbS, usar BaU
-        no_nbs_mask = np.isnan(nbs_data)
-        manning_final[no_nbs_mask] = bau_data[no_nbs_mask]
-
-        meta = lulc_src.meta.copy()
-        meta.update(dtype="float32", count=1)
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        with rasterio.open(output_path, "w", **meta) as dst:
-            dst.write(manning_final.astype(np.float32), 1)
 
 def generate_nbs_manning(
         lulc_raster: str,  # Raster de uso de suelo base (FastFlood)
@@ -2035,163 +2498,6 @@ def generate_nbs_manning(
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with rasterio.open(output_path, "w", **meta) as dst:
             dst.write(manning_final.astype(np.float32), 1)
-
-
-def generate_nbs_infiltration_old(
-    lulc_raster: str,                     # LULC FastFlood (alineado)
-    lulc_raster_r_path: str,             # LULC waterproof (alineado)
-    nbs_raster: str,                     # Portafolio (alineado)
-    bau_raster: str,
-    infiltration_base_path: str,          # Infiltración BaU (alineado)
-    output_path: str,
-    lulc_fastflood_to_lulc_end: Dict[int, int],  # Mapeo de LULC FF a final
-    locked_categories: Set[int],         # Categorías que no deben cambiar
-    infiltration_dict: Dict[Tuple[int, int], float],
-
-):
-    """Build final NbS infiltration raster based on prioritized actions, respecting locked areas and improving from BaU when allowed."""
-    with rasterio.open(lulc_raster) as lulc_src, \
-         rasterio.open(lulc_raster_r_path) as lulc_src_r, \
-         rasterio.open(nbs_raster) as nbs_src, \
-         rasterio.open(infiltration_base_path) as infil_src,\
-         rasterio.open(bau_raster) as bau_src:
-
-        lulc_data       = lulc_src.read(1)
-        lulc_data_wp    = lulc_src_r.read(1)
-        nbs_data        = nbs_src.read(1)
-        bau_data        = bau_src.read(1)
-        infiltration_inicial = infil_src.read(1).astype(np.float32)
-
-        infiltration        = np.full(nbs_data.shape, np.nan, dtype=np.float32)
-        flat_nbs            = nbs_data.ravel()
-        flat_lulc           = lulc_data_wp.ravel()
-        infiltration_out    = infiltration.ravel()
-
-        for idx in range(flat_nbs.size):
-            key = (flat_nbs[idx], flat_lulc[idx])
-            if key in infiltration_dict:
-                infiltration_out[idx] = infiltration_dict[key]
-
-        temp_data = infiltration_out.reshape(nbs_data.shape)
-
-        # 1️⃣ Infiltración base desde LULC o raster
-        infiltration_final = infiltration_inicial.copy()
-
-        # 2️⃣ Máscaras
-        locked_mask = np.isin(lulc_data, list(locked_categories))
-        not_locked = ~locked_mask
-        valid_temp = ~np.isnan(temp_data)
-        has_nbs = ~np.isnan(nbs_data)
-
-        # 3️⃣ Regla 1: usar temp si mejora (mayor infiltración) y hay NbS
-        condition_temp_greater = (temp_data > infiltration_inicial) & not_locked & valid_temp & has_nbs
-        infiltration_final[condition_temp_greater] = temp_data[condition_temp_greater]
-
-        # 4️⃣ Regla 2: usar tabla (NbS, LULC) cuando temp no mejora pero hay NbS
-        remaining_mask = not_locked & valid_temp & ~condition_temp_greater & has_nbs
-        if np.any(remaining_mask):  # Solo ejecuta si hay elementos en el remaining_mask
-            nbs_flat = nbs_data[remaining_mask].astype(np.uint8)
-            lulc_flat = lulc_data[remaining_mask].astype(np.uint8)
-            base_flat = infiltration_inicial[remaining_mask]
-            mapped_lulc_flat = np.vectorize(lulc_fastflood_to_lulc_end.get)(lulc_flat)
-
-            final_values = base_flat.copy()
-            for idx, (nbs_val, lulc_val) in enumerate(zip(nbs_flat, mapped_lulc_flat)):
-                key = (nbs_val, lulc_val)
-                if key in infiltration_dict:
-                    final_values[idx] = infiltration_dict[key]
-
-            infiltration_final[remaining_mask] = final_values
-
-
-        # 5️⃣ Regla 3: donde no hay NbS, usar BaU
-        no_nbs_mask = np.isnan(nbs_data)
-        infiltration_final[no_nbs_mask] = bau_data[no_nbs_mask]
-
-        # Guardar raster final
-        meta = lulc_src.meta.copy()
-        meta.update(dtype="float32", count=1)
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        with rasterio.open(output_path, "w", **meta) as dst:
-            dst.write(infiltration_final.astype(np.float32), 1)
-
-def generate_nbs_infiltration_Value(
-    lulc_raster: str,  # LULC FastFlood (alineado)
-    lulc_raster_r_path: str,  # LULC waterproof (alineado)
-    nbs_raster: str,  # Portafolio (alineado)
-    infiltration_base_path: str,  # Raster base de infiltración (sin NbS)
-    bau_raster: str,  # Raster BaU de infiltración
-    output_path: str,
-    lulc_fastflood_to_lulc_end: Dict[int, int],
-    locked_categories: Set[int],
-    infiltration_dict: Dict[Tuple[int, int], float]
-):
-    """Genera un raster de infiltración modificado por NbS, partiendo del raster BaU
-    y aplicando mejoras solo en celdas con NbS y no bloqueadas.
-    """
-    with rasterio.open(lulc_raster) as lulc_src, \
-         rasterio.open(lulc_raster_r_path) as lulc_src_r, \
-         rasterio.open(nbs_raster) as nbs_src, \
-         rasterio.open(infiltration_base_path) as infil_src, \
-         rasterio.open(bau_raster) as bau_src:
-
-        lulc_data    = lulc_src.read(1)
-        lulc_data_wp = lulc_src_r.read(1)
-        nbs_data     = nbs_src.read(1)
-        base_data    = infil_src.read(1).astype(np.float32)  # infiltración por LULC
-        bau_data     = bau_src.read(1).astype(np.float32)    # infiltración BaU
-
-        # 1️⃣ Iniciar con copia del BaU: TODO queda igual salvo NbS
-        infiltration_final = bau_data.copy()
-
-        # 2️⃣ Crear matriz temporal de posibles mejoras
-        infiltration_temp = np.full(nbs_data.shape, np.nan, dtype=np.float32)
-        flat_nbs          = nbs_data.ravel()
-        flat_lulc         = lulc_data_wp.ravel()
-        infiltration_out  = infiltration_temp.ravel()
-
-        for idx in range(flat_nbs.size):
-            key = (flat_nbs[idx], flat_lulc[idx])
-            if key in infiltration_dict:
-                infiltration_out[idx] = infiltration_dict[key]
-
-        temp_data = infiltration_out.reshape(nbs_data.shape)
-
-        # 3️⃣ Máscaras
-        has_nbs     = ~np.isnan(nbs_data)
-        locked_mask = np.isin(lulc_data, list(locked_categories))
-        not_locked  = ~locked_mask
-        valid_temp  = ~np.isnan(temp_data)
-
-        # 4️⃣ Regla 1: si mejora (más infiltración), se usa
-        condition_temp_greater = (temp_data > base_data) & not_locked & valid_temp & has_nbs
-        infiltration_final[condition_temp_greater] = temp_data[condition_temp_greater]
-
-        # 5️⃣ Regla 2: si no mejora pero hay NbS, intentar con (NbS, LULC_final)
-        remaining_mask = not_locked & valid_temp & ~condition_temp_greater & has_nbs
-        if np.any(remaining_mask):
-            nbs_flat         = nbs_data[remaining_mask].astype(np.uint8)
-            lulc_flat        = lulc_data[remaining_mask].astype(np.uint8)
-            base_flat        = base_data[remaining_mask]
-            mapped_lulc_flat = np.vectorize(lulc_fastflood_to_lulc_end.get)(lulc_flat)
-
-            final_values = base_flat.copy()
-            for idx, (nbs_val, lulc_val) in enumerate(zip(nbs_flat, mapped_lulc_flat)):
-                key = (nbs_val, lulc_val)
-                if key in infiltration_dict:
-                    final_values[idx] = infiltration_dict[key]
-
-            infiltration_final[remaining_mask] = final_values
-
-        # ✅ No se aplica ninguna modificación fuera de zonas con NbS
-        # Las zonas sin NbS siguen con bau_data porque infiltration_final = bau_data.copy()
-
-        # 6️⃣ Guardar salida
-        meta = lulc_src.meta.copy()
-        meta.update(dtype="float32", count=1)
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        with rasterio.open(output_path, "w", **meta) as dst:
-            dst.write(infiltration_final.astype(np.float32), 1)
 
 def generate_nbs_infiltration(
     lulc_raster: str,  # LULC FastFlood (alineado)
@@ -2326,6 +2632,66 @@ def red_params_from_json(json_path):
 
     return lulc_to_manning,manning_dict, infiltracion_dict, infiltration_change_dict, inputs_paths,path_out
 
+def Indicators_BaU_NBS(PathProject):
+    # ------------------------------------------------------------------------------------------------------------------
+    # Indicadores para carbono
+    # ------------------------------------------------------------------------------------------------------------------
+    # Name Columns
+    NameCol = ['WC (Ton)']
+
+    BaU = pd.read_csv(os.path.join(PathProject, 'in', 'INPUTS_CARBON_BaU.csv'), usecols=NameCol)
+    NBS = pd.read_csv(os.path.join(PathProject, 'in', 'INPUTS_CARBON_NbS.csv'), usecols=NameCol)
+
+    BaU = BaU.drop([0])
+    NBS = NBS.drop([0])
+
+    # Indicators
+    Indicators = ((NBS - BaU)/BaU)*100
+
+    Tmp = [[Indicators['WC (Ton)'].max()]]
+
+    Final_In = pd.DataFrame(data=Tmp, columns=NameCol)
+
+    Indicators = np.round(Indicators,2)
+    Final_In   = np.round(Final_In,2)
+
+    Indicators.to_csv(os.path.join(PathProject, 'out', 'OUTPUTS_Indicators_TimeSeries.csv'), index_label='Time')
+    Final_In.to_csv(os.path.join(PathProject, 'out', 'OUTPUTS_Max_Indicators.csv'), index_label='Time')
+
+    # Integrated Indicator
+    Indicators = ((NBS - BaU)/BaU)*100
+
+    # Indicador total - Curvas integradas
+    Int_NBS     = np.trapezoid(NBS, dx=1.0, axis=0)
+    Int_BaU     = np.trapezoid(BaU, dx=1.0, axis=0)
+    Tmp         = ((Int_NBS - Int_BaU) / Int_BaU) * 100
+
+    Final_In = pd.DataFrame(data=Tmp, columns=NameCol)
+
+    Indicators = np.round(Indicators,2)
+    Indicators = (Indicators*0 + 1)*Tmp
+    Final_In   = np.round(Final_In,2)
+
+    Indicators.to_csv(os.path.join(PathProject,'out','OUTPUTS-Indicators_TimeSeries_Total.csv'), index_label='Time')
+    Final_In.to_csv(os.path.join(PathProject,'out','OUTPUTS-Max_Indicators_Total.csv'), index_label='Time')
+
+    # ------------------------------------------------------------------------------------------------------------------
+    # Indicadores para inundación
+    # ------------------------------------------------------------------------------------------------------------------
+    BaU = pd.read_csv(os.path.join(PathProject, 'in', 'INPUTS_FLOOD_BaU.csv'), index_col=0)
+    NBS = pd.read_csv(os.path.join(PathProject, 'in', 'INPUTS_FLOOD_NBS.csv'), index_col=0)
+
+    Indicators = [
+                  ((NBS['Maximum Flood Depth [m]'][10] - BaU['Maximum Flood Depth [m]'][10]) / BaU['Maximum Flood Depth [m]'][10]) * 100,
+                  ((NBS['Maximum Flood Depth [m]'][100] - BaU['Maximum Flood Depth [m]'][100]) / BaU['Maximum Flood Depth [m]'][100]) * 100,
+                  ((NBS['Flood Area [ha]'].sum() - BaU['Flood Area [ha]'].sum()) / BaU['Flood Area [ha]'].sum()) * 100,
+                  Tmp[0]]
+
+    Results = pd.DataFrame(data=np.array([Indicators]),
+                           columns=['Maximum Flood Depth TR 10', 'Maximum Flood Depth TR 100','Flooded Area','Carbon'],index=[0])
+
+    Results.to_csv(os.path.join(PathProject, 'out', 'OUTPUTS-Indicators.csv'),index=False)
+
 def BashFastFlood(JSONPath):
 
     # ------------------------------------------------------------------------------------------------------------------
@@ -2347,7 +2713,7 @@ def BashFastFlood(JSONPath):
     log_file = os.path.join(UserData['ProjectPath'],UserData["NameBasinFolder"],'log_FastFlood.txt')
 
     # Abrir el archivo log en modo escritura
-    log = open(log_file, 'w')
+    log = open(log_file, 'a')
 
     # ------------------------------------------------------------------------------------------------------------------
     # Crear las carpetas para la ejecución de FastFlood
@@ -2365,20 +2731,24 @@ def BashFastFlood(JSONPath):
                                   40: 4,  # Agricultural
                                   50: 5,  # Building
                                   60: 6,  # Bare area
-                                  70: 1,
-                                  80: 1}
+                                  70: 0,  # Ice
+                                  80: 1}  # Water
 
     lulc_bau_to_lulcfastflood = {2: 10,  # Forest
                                  7: 20,  # Shrublands
                                  3: 30,  # Grassland
                                  4: 40,  # Agricultural
+                                 5: 50,  # Building
                                  6: 60,  # Bare area
-                                 5: 50,
-                                 1: 80}
+                                 0: 70,  # Ice
+                                 1: 80}  # Water
 
     # Categorias bloqueadas para el análisis
-    locked_categories = {50, 70, 80, 90, 100, 110}
+    locked_categories = {1, 50, 70, 80, 90, 100, 110}
 
+    # ------------------------------------------------------------------------------------------------------------------
+    # Configurar entradas para contruccińo de rasters de Infiltración y n-Manning en BaU y SbN
+    # ------------------------------------------------------------------------------------------------------------------
     # Leer parámetros del JSON
     lulc_to_manning, manning_dict, infiltracion_dict, infiltration_change_dict, raster_inputs, path_out = red_params_from_json(
         JSONPath)
@@ -2386,7 +2756,9 @@ def BashFastFlood(JSONPath):
     # Ajustar raster a la misma extensión y alineación
     aligned, ref_raster = resample_all_to_highest_resolution(raster_inputs, os.path.join(ProjectPath, 'out', '06-FLOOD', 'Tmp','Resampled'))
 
-    # 2. Crear rasters BaU
+    # ------------------------------------------------------------------------------------------------------------------
+    # Crear rasters de n-Manning para BaU
+    # ------------------------------------------------------------------------------------------------------------------
     generate_manning_bau(
         aligned["lulc_fastflood"],
         aligned["bau_lulc"],
@@ -2398,6 +2770,14 @@ def BashFastFlood(JSONPath):
         use_raster=False  # ← cambia a False si quieres forzar el diccionario  # ahora aprovechamos tu raster base
     )
 
+    # Check - Los n-Manning en el BaU nunca deben ser mayor que el Current
+    n_H     = os.path.join(ProjectPath, "in", "06-FLOOD", "Raster", "Manning.tif")
+    n_BaU   = os.path.join(ProjectPath, "in", "06-FLOOD", "Raster", "Manning_BaU.tif")
+    CheckPixelDepth_BAU_NBS(n_H, n_BaU, n_BaU)
+
+    # ------------------------------------------------------------------------------------------------------------------
+    # Crear rasters de infiltración para BaU
+    # ------------------------------------------------------------------------------------------------------------------
     generate_infiltracion_bau(
         aligned["lulc_fastflood"],
         aligned["waterproof_current"],
@@ -2408,6 +2788,14 @@ def BashFastFlood(JSONPath):
         infiltration_change_dict
     )
 
+    # Check - La Infiltración en el BaU nunca debe ser mayor que el Current
+    n_H     = os.path.join(ProjectPath, "in", "06-FLOOD", "Raster", "Infiltration.tif")
+    n_BaU   = os.path.join(ProjectPath, "in", "06-FLOOD", "Raster", "Infiltration_BaU.tif")
+    CheckPixelDepth_BAU_NBS(n_H, n_BaU, n_BaU)
+
+    # ------------------------------------------------------------------------------------------------------------------
+    # Crear rasters de n-Manning para SbN
+    # ------------------------------------------------------------------------------------------------------------------
     generate_nbs_manning(
         aligned["lulc_fastflood"],  # LULC FastFlood (alineado)
         aligned["waterproof_current"],  # LULC waterproof (alineado)
@@ -2420,6 +2808,9 @@ def BashFastFlood(JSONPath):
         manning_dict,
     )
 
+    # ------------------------------------------------------------------------------------------------------------------
+    # Crear rasters de infiltración para SbN
+    # ------------------------------------------------------------------------------------------------------------------
     generate_nbs_infiltration(aligned["lulc_fastflood"],  # LULC FastFlood (alineado)
                               aligned["waterproof_current"],  # LULC waterproof (alineado)
                               aligned["portafolio"],  # Portafolio (alineado)
@@ -2460,6 +2851,7 @@ def BashFastFlood(JSONPath):
     CodeLULC['Industrial']  = [21, 22, 23, 24, 25]
     CodeLULC['InfraRoads']  = [1]
     CodeLULC['Agriculture'] = [40]
+    CodeLULC['GHS_BUILT']   = [11, 12, 13, 14, 15, 21, 22, 23, 24, 25, 40]
 
     LULC_Damage = {}
     LULC_Damage['Residential'] = f'{ProjectPath}/in/06-FLOOD/Raster/GHS_BUILT_C_Agri.tif'
@@ -2467,6 +2859,7 @@ def BashFastFlood(JSONPath):
     LULC_Damage['Industrial']  = f'{ProjectPath}/in/06-FLOOD/Raster/GHS_BUILT_C_Agri.tif'
     LULC_Damage['InfraRoads']  = f'{ProjectPath}/in/06-FLOOD/Raster/Road.tif'
     LULC_Damage['Agriculture'] = f'{ProjectPath}/in/06-FLOOD/Raster/GHS_BUILT_C_Agri.tif'
+    LULC_Damage['GHS_BUILT']   = f'{ProjectPath}/in/06-FLOOD/Raster/GHS_BUILT_C_Agri.tif'
 
     # Recortar base de datos de GHS-BUILT-C
     carpeta_tiles   = os.path.join(UserData["DamagesDataBasePath"],"01-GHS-BUILT-C")
@@ -2482,6 +2875,19 @@ def BashFastFlood(JSONPath):
     aoi_path        = UserData['CatchmentPath']
     ruta_salida     = LULC_Damage['InfraRoads']
     Clic_Mosaic_DataBase(carpeta_tiles, aoi_path, ruta_salida)
+
+    # ------------------------------------------------------------------------------------------------------------------
+    # Generar IDF y obtener tormenta de diseño
+    # ------------------------------------------------------------------------------------------------------------------
+    carpeta_tiles = os.path.join(UserData["DamagesDataBasePath"], "03-IDF")
+    aoi_path    = UserData['CatchmentPath']
+    ruta_salida = os.path.join(UserData['ProjectPath'], UserData["NameBasinFolder"], 'in', '06-FLOOD', 'Raster','IDF.csv')
+    df_idf = calcular_estadisticas_idf_cuenca(
+        carpeta_tiles,
+        aoi_path,
+        'mean')
+
+    df_idf.to_csv(ruta_salida)
 
     # ------------------------------------------------------------------------------------------------------------------
     # Ejecutar Escenarios (Historic, BaU, NbS)
@@ -2521,7 +2927,18 @@ def BashFastFlood(JSONPath):
                              BasinPath=UserData['CatchmentPath'],
                              Channel=Channel,
                              BoundaryCondition=BoundaryCondition,
-                             log=log)
+                             log=log, IDF_Table=df_idf, StatusExe=True)
+
+    # ------------------------------------------------------------------------------------------------------------------
+    # Check - Se verifica que las profundidades del escenario BaU nunca sean menores que las del escenario Current.
+    # ------------------------------------------------------------------------------------------------------------------
+    # '''
+    for TR_i in UserData["ClimateParams"]["ReturnPeriod"]:
+        H_Path_H   = ProjectPath + f'/out/06-FLOOD/Flood/Flood_Current_TR-{TR_i}.tif'
+        H_Path_BaU = ProjectPath + f'/out/06-FLOOD/Flood/Flood_BaU_TR-{TR_i}.tif'
+        # Check
+        CheckPixelDepth_BAU_Current(H_Path_H, H_Path_BaU, H_Path_BaU)
+    # '''
 
     # ------------------------------------------------------------------------------------------------------------------
     # Check - Se verifica que las profundidades del escenario NbS nunca sean mayores que las del escenario BaU.
@@ -2547,7 +2964,8 @@ def BashFastFlood(JSONPath):
 
     # Leer curvas de daño
     DC = ReadDamageCurve(ProjectPath=os.path.join(UserData['ProjectPath'],UserData["NameBasinFolder"]))
-    log.write(f"Read Dagame Curve - Ok \n")
+    LogMessage = f"Read Dagame Curve - Ok \n"
+    log.write(LogMessage)
 
     '''
     Ojo! mirar el tema de la tasa de cambio para estar acorde con la moneda de análisis de WaterProof
@@ -2601,11 +3019,21 @@ def BashFastFlood(JSONPath):
         df['Peak Descharge [m3/s]'] = RR
         df.to_csv(f'{UserData["ProjectPath"]}/INDICATORS/in/INPUTS_FLOOD_{Sce}.csv',index=False)
 
+        # ----------------------------------------------------------------------------------------------------------
+        # Calculo de las profundidades por uso de suelo de daño
+        # ----------------------------------------------------------------------------------------------------------
+        df_H = pd.concat([Raster2DataFrame_Damages(LULC_Damage['GHS_BUILT'], HPaths['H'][Sce], CodeLULC['GHS_BUILT'], UserData["CatchmentPath"]),
+                          Raster2DataFrame_Damages(LULC_Damage['InfraRoads'], HPaths['H'][Sce], CodeLULC['InfraRoads'],UserData["CatchmentPath"])],ignore_index=True)
+
         for Cat in Cat_Damage:
             # ----------------------------------------------------------------------------------------------------------
             # Calculo de las profundidades por uso de suelo de daño
             # ----------------------------------------------------------------------------------------------------------
-            df = Raster2DataFrame_Damages(LULC_Damage[Cat], HPaths['H'][Sce], CodeLULC[Cat], UserData["CatchmentPath"])
+            # df = Raster2DataFrame_Damages(LULC_Damage[Cat], HPaths['H'][Sce], CodeLULC[Cat], UserData["CatchmentPath"])
+            # df.to_csv( f'{UserData["ProjectPath"]}/{UserData["NameBasinFolder"]}/out/06-FLOOD/Flood/H_{Cat}_{Sce}.csv', index=False)
+            # log.write(f"Read flood depth for the {Sce} scenario for {Cat} damages category- Ok \n")
+
+            df = df_H[df_H['Code'].isin(CodeLULC[Cat])]
             df.to_csv( f'{UserData["ProjectPath"]}/{UserData["NameBasinFolder"]}/out/06-FLOOD/Flood/H_{Cat}_{Sce}.csv', index=False)
             log.write(f"Read flood depth for the {Sce} scenario for {Cat} damages category- Ok \n")
 
@@ -2630,6 +3058,8 @@ def BashFastFlood(JSONPath):
             # Agregar datos
             Total_EAD.loc[Sce, Cat] = OutEAD.sum().sum()
             log.write(f"Estimated cumulative annual expected damages for the {Sce} scenario for {Cat} damages category- Ok- Ok \n")
+
+            print(f"Estimated cumulative annual expected damages for the {Sce} scenario for {Cat} damages category -> Ok")
 
     # Guardar total
     Total_EAD.to_csv(os.path.join(ProjectPath, 'out', '06-FLOOD', 'Damages', f'03-Expected_Annual_Damage_Total.csv'),index_label='Scenarios')
@@ -2687,62 +3117,4 @@ def BashFastFlood(JSONPath):
     log.close()
     #"""
 
-def Indicators_BaU_NBS(PathProject):
-    # ------------------------------------------------------------------------------------------------------------------
-    # Indicadores para carbono
-    # ------------------------------------------------------------------------------------------------------------------
-    # Name Columns
-    NameCol = ['WC (Ton)']
 
-    BaU = pd.read_csv(os.path.join(PathProject, 'in', 'INPUTS_CARBON_BaU.csv'), usecols=NameCol)
-    NBS = pd.read_csv(os.path.join(PathProject, 'in', 'INPUTS_CARBON_NBS.csv'), usecols=NameCol)
-
-    BaU = BaU.drop([0])
-    NBS = NBS.drop([0])
-
-    # Indicators
-    Indicators = ((NBS - BaU)/BaU)*100
-
-    Tmp = [[Indicators['WC (Ton)'].max()]]
-
-    Final_In = pd.DataFrame(data=Tmp, columns=NameCol)
-
-    Indicators = np.round(Indicators,2)
-    Final_In   = np.round(Final_In,2)
-
-    Indicators.to_csv(os.path.join(PathProject, 'out', 'OUTPUTS_Indicators_TimeSeries.csv'), index_label='Time')
-    Final_In.to_csv(os.path.join(PathProject, 'out', 'OUTPUTS_Max_Indicators.csv'), index_label='Time')
-
-    # Integrated Indicator
-    Indicators = ((NBS - BaU)/BaU)*100
-
-    # Indicador total - Curvas integradas
-    Int_NBS     = np.trapezoid(NBS, dx=1.0, axis=0)
-    Int_BaU     = np.trapezoid(BaU, dx=1.0, axis=0)
-    Tmp         = ((Int_NBS - Int_BaU) / Int_BaU) * 100
-
-    Final_In = pd.DataFrame(data=Tmp, columns=NameCol)
-
-    Indicators = np.round(Indicators,2)
-    Indicators = (Indicators*0 + 1)*Tmp
-    Final_In   = np.round(Final_In,2)
-
-    Indicators.to_csv(os.path.join(PathProject,'out','OUTPUTS-Indicators_TimeSeries_Total.csv'), index_label='Time')
-    Final_In.to_csv(os.path.join(PathProject,'out','OUTPUTS-Max_Indicators_Total.csv'), index_label='Time')
-
-    # ------------------------------------------------------------------------------------------------------------------
-    # Indicadores para inundación
-    # ------------------------------------------------------------------------------------------------------------------
-    BaU = pd.read_csv(os.path.join(PathProject, 'in', 'INPUTS_FLOOD_BaU.csv'), index_col=0)
-    NBS = pd.read_csv(os.path.join(PathProject, 'in', 'INPUTS_FLOOD_NBS.csv'), index_col=0)
-
-    Indicators = [
-                  ((NBS['Maximum Flood Depth [m]'][10] - BaU['Maximum Flood Depth [m]'][10]) / BaU['Maximum Flood Depth [m]'][10]) * 100,
-                  ((NBS['Maximum Flood Depth [m]'][100] - BaU['Maximum Flood Depth [m]'][100]) / BaU['Maximum Flood Depth [m]'][100]) * 100,
-                  ((NBS['Flood Area [ha]'].sum() - BaU['Flood Area [ha]'].sum()) / BaU['Flood Area [ha]'].sum()) * 100,
-                  Tmp[0]]
-
-    Results = pd.DataFrame(data=np.array([Indicators]),
-                           columns=['Maximum Flood Depth TR 10', 'Maximum Flood Depth TR 100','Flooded Area','Carbon'],index=[0])
-
-    Results.to_csv(os.path.join(PathProject, 'out', 'OUTPUTS-Indicators.csv'),index=False)
