@@ -461,7 +461,7 @@ def Get_Basin_bbox(shp_path):
     maxx, maxy = transformer.transform(maxx, maxy)
 
     # Devolver las coordenadas transformadas
-    return [minx, maxy, maxx, miny]
+    return [minx, miny, maxx, maxy]
 
 def DownloadInputs(FastFloodPath, Basin_shp_BoundingBox, DemResolution, DEM_Path, key=None,
                    Manning_Path=None, LULC_Path=None, Inf_Path=None, IDF_Path=None, Fac_CC_Path=None,
@@ -478,7 +478,7 @@ def DownloadInputs(FastFloodPath, Basin_shp_BoundingBox, DemResolution, DEM_Path
         Ruta local del ejecutable de FastFlood.
     Basin_shp_BoundingBox : list or str
         Ruta del shapefile de la cuenca o
-        Coordenadas del bounding box de la cuenca en proyección pseudo-Mercator (EPSG:3857) (e.g., [xmin, ymin, xmax, ymax]).
+        Coordenadas del bounding box de la cuenca en proyección pseudo-Mercator (EPSG:3857) (e.g., [xmin, ymax, xmax, ymin]).
     DemResolution : int
         Resolución del DEM a descargar. Valores válidos: [20, 40, 150, 300, 600] (en metros).
     DEM_Path : str
@@ -528,10 +528,17 @@ def DownloadInputs(FastFloodPath, Basin_shp_BoundingBox, DemResolution, DEM_Path
     # ------------------------------------------------------------------------------------------------------------------
     # Se estima el buffer para el dominio de descarga de la información
     Buffer_m    = Buffer_km*1000
+    # xmin
     BasinBox[0] = BasinBox[0] - Buffer_m
+    # ymin
     BasinBox[1] = BasinBox[1] + Buffer_m
+    # xmax
     BasinBox[2] = BasinBox[2] + Buffer_m
+    # ymax
     BasinBox[3] = BasinBox[3] - Buffer_m
+
+    # Orden FastFlood Xmin Ymax Xmax Ymin
+    BasinBox = [BasinBox[0], BasinBox[3], BasinBox[2], BasinBox[1]]
 
     if log is not None:
         # Agregar información al log
@@ -578,6 +585,7 @@ def DownloadInputs(FastFloodPath, Basin_shp_BoundingBox, DemResolution, DEM_Path
                 ExeFastFlood(Comando, log)
             else:
                 ExeFastFlood(Comando)
+
 
 def CommandFastFlood(NameCommand,
                      FastFloodPath, key=None, customurl=None,
