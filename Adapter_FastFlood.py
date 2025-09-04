@@ -531,11 +531,11 @@ def DownloadInputs(FastFloodPath, Basin_shp_BoundingBox, DemResolution, DEM_Path
     # xmin
     BasinBox[0] = BasinBox[0] - Buffer_m
     # ymin
-    BasinBox[1] = BasinBox[1] + Buffer_m
+    BasinBox[1] = BasinBox[1] - Buffer_m
     # xmax
     BasinBox[2] = BasinBox[2] + Buffer_m
     # ymax
-    BasinBox[3] = BasinBox[3] - Buffer_m
+    BasinBox[3] = BasinBox[3] + Buffer_m
 
     # Orden FastFlood Xmin Ymax Xmax Ymin
     BasinBox = [BasinBox[0], BasinBox[3], BasinBox[2], BasinBox[1]]
