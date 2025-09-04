@@ -2889,6 +2889,10 @@ def BashFastFlood(JSONPath):
 
     df_idf.to_csv(ruta_salida)
 
+    # Del raster original se tienen las precipitaciones totales por cada duración por TR. Para generar la intensidades
+    # dividimos por la duración
+    df_idf = df_idf / np.array([[3], [6], [12], [24], [48], [72], [120], [240]])
+
     # ------------------------------------------------------------------------------------------------------------------
     # Ejecutar Escenarios (Historic, BaU, NbS)
     # ------------------------------------------------------------------------------------------------------------------
