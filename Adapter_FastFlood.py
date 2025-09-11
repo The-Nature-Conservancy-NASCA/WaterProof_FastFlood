@@ -1906,7 +1906,7 @@ def Clic_Mosaic_DataBase(carpeta_tiles, aoi_path, ruta_salida, crs_salida=None, 
            Ruta a la carpeta que contiene los archivos raster .tif.
 
        aoi_path : str
-           Ruta al archivo AOI (puede ser shapefile, geojson, geopackage o raster .tif).
+           Ruta al archivo Threshold_H=(puede ser shapefile, geojson, geopackage o raster .tif).
 
        ruta_salida : str
            Ruta de salida donde se guardará el mosaico final en formato GeoTIFF.
@@ -1914,8 +1914,8 @@ def Clic_Mosaic_DataBase(carpeta_tiles, aoi_path, ruta_salida, crs_salida=None, 
        crs_salida : str, opcional
            CRS de salida (por defecto usa el CRS de los tiles).
 
-       simplificar_aoi : float, opcional
-           Tolerancia para simplificar la geometría del AOI (en unidades del CRS del AOI).
+       simplificar_Threshold_H: float, opcional
+           Tolerancia para simplificar la geometría del Threshold_H(en unidades del CRS del AOI).
 
        recorte_exacto : bool, opcional
            Si True, recorta el mosaico con la forma exacta del shapefile.
@@ -1930,32 +1930,32 @@ def Clic_Mosaic_DataBase(carpeta_tiles, aoi_path, ruta_salida, crs_salida=None, 
     """
     start_total = time.perf_counter()
 
-    # === A. Leer AOI ===
+    # === A. Leer Threshold_H===
     t0 = time.perf_counter()
     ext = os.path.splitext(aoi_path)[1].lower()
     if ext in [".shp", ".geojson", ".gpkg"]:
         with fiona.open(aoi_path, "r") as src:
-            crs_aoi = CRS.from_wkt(src.crs_wkt)
+            crs_Threshold_H= CRS.from_wkt(src.crs_wkt)
             geometries = [shape(f["geometry"]) for f in src]
         geom_union = unary_union(geometries)
         # Guardar la geometría original para el recorte exacto
         geom_original = geom_union
     elif ext in [".tif", ".tiff"]:
         with rasterio.open(aoi_path) as src:
-            crs_aoi = CRS(src.crs)
+            crs_Threshold_H= CRS(src.crs)
             bounds = src.bounds
             geom_union = box(*bounds)
             # Para rasters, la geometría original es la misma que la union
             geom_original = geom_union
     else:
-        raise ValueError("AOI debe ser shapefile o ráster")
+        raise ValueError("Threshold_Hdebe ser shapefile o ráster")
 
     if simplificar_aoi:
         geom_union = geom_union.simplify(simplificar_aoi)
         # Si se simplifica, también actualizar la geometría original si se va a usar recorte exacto
         if recorte_exacto:
             geom_original = geom_union
-    if verbose: print(f"A. AOI cargado en {time.perf_counter() - t0:.2f} s")
+    if verbose: print(f"A. Threshold_Hcargado en {time.perf_counter() - t0:.2f} s")
 
     # === B. Leer/crear índice CSV ===
     t0 = time.perf_counter()
@@ -1983,11 +1983,11 @@ def Clic_Mosaic_DataBase(carpeta_tiles, aoi_path, ruta_salida, crs_salida=None, 
         bbox_df.to_csv(csv_index, index=False)
     if verbose: print(f"B. Índice bbox en {time.perf_counter() - t0:.2f} s")
 
-    # === C. Reproyectar AOI ===
+    # === C. Reproyectar Threshold_H===
     t0 = time.perf_counter()
     crs_tiles = CRS.from_user_input(bbox_df.iloc[0]["crs"])
-    if crs_aoi != crs_tiles:
-        transformer = Transformer.from_crs(crs_aoi, crs_tiles, always_xy=True)
+    if crs_Threshold_H!= crs_tiles:
+        transformer = Transformer.from_crs(crs_Threshold_H, crs_tiles, always_xy=True)
         coords = list(geom_union.exterior.coords)
         coords_proj = [transformer.transform(x, y) for x, y in coords]
         geom_proj = box(*shape({'type': 'Polygon', 'coordinates': [coords_proj]}).bounds)
@@ -2421,7 +2421,7 @@ def generate_infiltracion_bau(
         with rasterio.open(output_path, 'w', **meta) as dst:
             dst.write(infil_final.astype(np.float32), 1)
 
-def generate_nbs_manning(
+def generate_nbs_manning_Old(
         lulc_raster: str,  # Raster de uso de suelo base (FastFlood)
         lulc_raster_r_path: str,  # Raster de uso de suelo Waterproof
         nbs_raster: str,  # Raster con portafolio de acciones NbS priorizadas
@@ -2506,6 +2506,145 @@ def generate_nbs_manning(
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with rasterio.open(output_path, "w", **meta) as dst:
             dst.write(manning_final.astype(np.float32), 1)
+
+
+def generate_nbs_manning(
+        lulc_raster: str,                     # Raster LULC base (FastFlood)
+        lulc_raster_r_path: str,              # Raster LULC Waterproof (LULC "final")
+        nbs_raster: str,                      # Raster con portafolio de NbS
+        bau_raster: str,                      # Raster de Manning BaU (sin NbS)
+        output_path: str,                     # Ruta de salida
+        lulc_mapping: Dict[int, float],       # LULC (FastFlood) -> Manning base
+        lulc_fastflood_to_lulc_end: Dict[int, int],  # LULC FastFlood -> LULC final
+        locked_categories: Set[int],          # LULC bloqueados (no modificar)
+        manning_dict: Dict[Tuple[int, int], float],  # (NbS, LULC_final) -> Manning
+        manning_base_path: Optional[str] = None,     # Raster alterno de Manning base
+        use_raster: bool = False,             # Usar manning_base_path en vez de lulc_mapping
+        default_manning: float = np.nan,      # Valor por defecto si falta mapping de Manning
+        default_lulc_final: int = -9999       # Marcador si falta mapping FastFlood->Final
+):
+    """
+    Genera un raster de Manning a partir del escenario BaU y aplica cambios
+    solo donde hay NbS válidas y no bloqueadas, usando manning_dict.
+
+    Notas prácticas:
+    - Evita np.vectorize; usa mapeos por np.unique (más seguro y claro).
+    - Maneja claves faltantes con valores por defecto.
+    - Respeta categorías bloqueadas y nodata de NbS.
+    """
+
+    def apply_dict_map(arr: np.ndarray,
+                       dct: Dict[int, float | int],
+                       default_val,
+                       out_dtype):
+        """
+        Aplica un diccionario a un array entero sin usar loops por pixel.
+        Cualquier clave faltante se mapea a `default_val`.
+        """
+        u, inv = np.unique(arr, return_inverse=True)
+        mapped_u = np.full(u.shape, default_val, dtype=out_dtype)
+        # Rellenar solo donde la clave exista
+        for i, key in enumerate(u):
+            v = dct.get(int(key), None)
+            if v is not None:
+                mapped_u[i] = v
+        return mapped_u[inv].reshape(arr.shape)
+
+    with rasterio.open(lulc_raster) as lulc_src, \
+         rasterio.open(lulc_raster_r_path) as lulc_src_r, \
+         rasterio.open(nbs_raster) as nbs_src, \
+         rasterio.open(bau_raster) as bau_src:
+
+        # Lecturas
+        lulc_ff   = lulc_src.read(1)       # LULC FastFlood
+        lulc_wp   = lulc_src_r.read(1)     # LULC final (Waterproof)
+        nbs_data  = nbs_src.read(1)
+        bau_data  = bau_src.read(1).astype(np.float32)
+
+        # Raster final parte de BaU (regla: celdas sin NbS quedan igual)
+        manning_final = bau_data.copy()
+
+        # Definir presencia de NbS de manera robusta
+        nbs_nodata = nbs_src.nodata
+        if nbs_nodata is None:
+            # Si no hay nodata, considera NbS presentes si > 0 (ajusta a tu codificación)
+            has_nbs = nbs_data > 0
+        else:
+            has_nbs = nbs_data != nbs_nodata
+
+        # Categorías bloqueadas (no tocar)
+        locked_mask = np.isin(lulc_ff, list(locked_categories))
+        not_locked  = ~locked_mask
+
+        # Manning inicial:
+        if use_raster and manning_base_path:
+            with rasterio.open(manning_base_path) as man_src:
+                manning_inicial = man_src.read(1).astype(np.float32)
+        else:
+            # Desde lulc_mapping (LULC FastFlood -> manning base)
+            manning_inicial = apply_dict_map(
+                arr=lulc_ff,
+                dct=lulc_mapping,
+                default_val=np.float32(default_manning),
+                out_dtype=np.float32
+            )
+
+        # TEMP: valores candidatos desde manning_dict[(NbS, LULC_final)]
+        # Primero, mapea FastFlood -> LULC_final donde haga falta
+        # (si ya tienes lulc_wp como "final", úsalo directo; si no, usa el mapping)
+        # Aquí usamos el LULC "final" proveniente de lulc_wp; si necesitas forzar
+        # el mapping de FastFlood->Final, aplica apply_dict_map(lulc_ff, ...)
+        lulc_final = lulc_wp.astype(np.int32)
+
+        # Construir temp_data solo donde haya NbS y no esté bloqueado
+        temp_data = np.full(nbs_data.shape, np.nan, dtype=np.float32)
+        candidate_mask = has_nbs & not_locked
+
+        if np.any(candidate_mask):
+            nbs_vals   = nbs_data[candidate_mask].astype(np.int32)
+            lulc_vals  = lulc_final[candidate_mask].astype(np.int32)
+            temp_flat  = temp_data[candidate_mask]
+
+            # Rellenar temp_flat con los valores de manning_dict cuando exista la clave
+            # (loop sobre candidatos; suele ser suficientemente rápido y claro)
+            for i, (nbs_val, lulc_val) in enumerate(zip(nbs_vals, lulc_vals)):
+                v = manning_dict.get((int(nbs_val), int(lulc_val)), None)
+                if v is not None:
+                    temp_flat[i] = np.float32(v)
+
+            # Escribir de regreso
+            temp_data[candidate_mask] = temp_flat
+
+        # REGLA 1: usar temp si mejora y hay NbS (y no está bloqueado)
+        # Nota: "mejorar" = temp > manning_inicial; ajusta el criterio si hace falta.
+        valid_temp = ~np.isnan(temp_data)
+        cond_temp_greater = valid_temp & candidate_mask & (temp_data > manning_inicial)
+        manning_final[cond_temp_greater] = temp_data[cond_temp_greater]
+
+        # REGLA 2: donde hay NbS y temp válido pero NO mejora, intenta tabla con (NbS, LULC_final)
+        remaining_mask = candidate_mask & valid_temp & (~cond_temp_greater)
+        if np.any(remaining_mask):
+            nbs_flat   = nbs_data[remaining_mask].astype(np.int32)
+            lulc_flat  = lulc_final[remaining_mask].astype(np.int32)
+            base_flat  = manning_inicial[remaining_mask].astype(np.float32)
+
+            final_values = base_flat.copy()
+            for i, (nbs_val, lulc_val) in enumerate(zip(nbs_flat, lulc_flat)):
+                v = manning_dict.get((int(nbs_val), int(lulc_val)), None)
+                if v is not None:
+                    final_values[i] = np.float32(v)
+
+            manning_final[remaining_mask] = final_values
+
+        # (Sin NbS) o (bloqueados) -> mantienen BaU ya copiado en manning_final
+
+        # Guardar
+        meta = lulc_src.meta.copy()
+        meta.update(dtype="float32", count=1)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with rasterio.open(output_path, "w", **meta) as dst:
+            dst.write(manning_final.astype(np.float32), 1)
+
 
 def generate_nbs_infiltration(
     lulc_raster: str,  # LULC FastFlood (alineado)
@@ -2687,7 +2826,7 @@ def Indicators_BaU_NBS(PathProject):
     # Indicadores para inundación
     # ------------------------------------------------------------------------------------------------------------------
     BaU = pd.read_csv(os.path.join(PathProject, 'in', 'INPUTS_FLOOD_BaU.csv'), index_col=0)
-    NBS = pd.read_csv(os.path.join(PathProject, 'in', 'INPUTS_FLOOD_NBS.csv'), index_col=0)
+    NBS = pd.read_csv(os.path.join(PathProject, 'in', 'INPUTS_FLOOD_NbS.csv'), index_col=0)
 
     Indicators = [
                   ((NBS['Maximum Flood Depth [m]'][10] - BaU['Maximum Flood Depth [m]'][10]) / BaU['Maximum Flood Depth [m]'][10]) * 100,
@@ -2895,11 +3034,10 @@ def BashFastFlood(JSONPath):
         aoi_path,
         'mean')
 
-    df_idf.to_csv(ruta_salida)
-
     # Del raster original se tienen las precipitaciones totales por cada duración por TR. Para generar la intensidades
     # dividimos por la duración
     df_idf = df_idf / np.array([[3], [6], [12], [24], [48], [72], [120], [240]])
+    df_idf.to_csv(ruta_salida)
 
     # ------------------------------------------------------------------------------------------------------------------
     # Ejecutar Escenarios (Historic, BaU, NbS)
@@ -3056,7 +3194,7 @@ def BashFastFlood(JSONPath):
                 df.drop('Code', axis=1, inplace=True)
 
             df = TR_Damage(df, DC, category=Cat)*FactorArea[Cat]
-            df.to_csv(f'{UserData["ProjectPath"]}/{UserData["NameBasinFolder"]}/out/06-FLOOD/Damages/01-Damage_{Cat}_{Sce}.csv', index=False)
+            # df.to_csv(f'{UserData["ProjectPath"]}/{UserData["NameBasinFolder"]}/out/06-FLOOD/Damages/01-Damage_{Cat}_{Sce}.csv', index=False)
             log.write(f"Damage estimation for each return period of the {Sce} scenario {Cat} - Ok \n")
 
             # ----------------------------------------------------------------------------------------------------------
@@ -3064,7 +3202,7 @@ def BashFastFlood(JSONPath):
             # ----------------------------------------------------------------------------------------------------------
             # Este factor corresponde a la división de área
             OutEAD = EAD(TR=UserData['ClimateParams']['ReturnPeriod'], Damage=df, NameCol=Cat)
-            OutEAD.to_csv(os.path.join(ProjectPath, 'out', '06-FLOOD', 'Damages', f'02-Expected_Annual_Damage_{Cat}_{Sce}.csv'))
+            # OutEAD.to_csv(os.path.join(ProjectPath, 'out', '06-FLOOD', 'Damages', f'02-Expected_Annual_Damage_{Cat}_{Sce}.csv'))
             log.write(f"Estimated annual expected damages for the {Sce} scenario for {Cat} damages category- Ok- Ok \n")
 
             # Agregar datos
