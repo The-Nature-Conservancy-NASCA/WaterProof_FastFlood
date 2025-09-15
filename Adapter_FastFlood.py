@@ -2829,13 +2829,13 @@ def Indicators_BaU_NBS(PathProject):
     NBS = pd.read_csv(os.path.join(PathProject, 'in', 'INPUTS_FLOOD_NbS.csv'), index_col=0)
 
     Indicators = [
-                  ((NBS['Maximum Flood Depth [m]'][10] - BaU['Maximum Flood Depth [m]'][10]) / BaU['Maximum Flood Depth [m]'][10]) * 100,
-                  ((NBS['Maximum Flood Depth [m]'][100] - BaU['Maximum Flood Depth [m]'][100]) / BaU['Maximum Flood Depth [m]'][100]) * 100,
+                  ((NBS['Peak Descharge [m3/s]'][10] - BaU['Peak Descharge [m3/s]'][10]) / BaU['Peak Descharge [m3/s]'][10]) * 100,
+                  ((NBS['Peak Descharge [m3/s]'][100] - BaU['Peak Descharge [m3/s]'][100]) / BaU['Peak Descharge [m3/s]'][100]) * 100,
                   ((NBS['Flood Area [ha]'].sum() - BaU['Flood Area [ha]'].sum()) / BaU['Flood Area [ha]'].sum()) * 100,
                   Tmp[0]]
 
     Results = pd.DataFrame(data=np.array([Indicators]),
-                           columns=['Maximum Flood Depth TR 10', 'Maximum Flood Depth TR 100','Flooded Area','Carbon'],index=[0])
+                           columns=['Peak Descharge TR 10', 'Peak Descharge TR 100','Flooded Area','Carbon'],index=[0])
 
     Results.to_csv(os.path.join(PathProject, 'out', 'OUTPUTS-Indicators.csv'),index=False)
 
