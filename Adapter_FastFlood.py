@@ -668,6 +668,7 @@ def CommandFastFlood(NameCommand,
     - Si el comando es 'Run', se asume que todos los insumos ya están listos y solo se arma el `-sim`.
     - La función **no ejecuta** el modelo, solo construye el comando.
     """
+    FactorCal = False
 
     # iniciar comando
     Comando = [FastFloodPath]
@@ -1055,12 +1056,13 @@ def TR_Damage(df_profundidad, df_costos, category='Residential'):
     valores_interpolados = interpolador(df_profundidad.values)
 
     # Seguro de maximo 1.0
-    valores_interpolados[valores_interpolados > 1.0] = 1.0
+    #valores_interpolados[valores_interpolados > 1.0] = 1.0
 
     # Reconstruir DataFrame con los mismos índices y columnas
     return pd.DataFrame(valores_interpolados,
                         index=df_profundidad.index,
                         columns=df_profundidad.columns)
+
 
 def EAD(TR, Damage,NameCol='EAD'):
     # Crear un DataFrame vacío para almacenar resultados
@@ -3077,8 +3079,8 @@ def BashFastFlood(JSONPath):
                              BasinPath=UserData['CatchmentPath'],
                              Channel=Channel,
                              BoundaryCondition=BoundaryCondition,
-                             log=log, IDF_Table=df_idf, StatusExe=True)
-
+                             log=log, IDF_Table=None, StatusExe=True)
+    # df_idf
     # ------------------------------------------------------------------------------------------------------------------
     # Check - Se verifica que las profundidades del escenario BaU nunca sean menores que las del escenario Current.
     # ------------------------------------------------------------------------------------------------------------------
