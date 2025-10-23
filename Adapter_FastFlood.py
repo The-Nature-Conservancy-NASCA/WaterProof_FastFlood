@@ -334,7 +334,7 @@ def ClicRasterWithBasin(ruta_raster, ruta_shapefile, salida='raster_recortado.ti
 
     print(f"✔️ Ráster recortado guardado en: {salida}")
 
-def CheckPixelDepth_BAU_NBS(ruta_raster1, ruta_raster2, salida='raster_recortado.tif'):
+def CheckPixelDepth(ruta_raster1, ruta_raster2, salida='raster_recortado.tif', Con=True):
     """
     Compara dos rásteres píxel a píxel. Si raster2 > raster1, reemplaza ese valor por el de raster1.
     Guarda el resultado con compresión LZW, tipo de dato ajustado automáticamente y bloques optimizados.
@@ -350,83 +350,206 @@ def CheckPixelDepth_BAU_NBS(ruta_raster1, ruta_raster2, salida='raster_recortado
         assert src1.shape == src2.shape, "Los rásteres deben tener la misma dimensión"
         assert src1.crs == src2.crs, "Los CRS deben coincidir"
 
-        with WarpedVRT(src1, resampling=Resampling.nearest) as vrt1, \
-             WarpedVRT(src2, resampling=Resampling.nearest) as vrt2:
+        # Leer directamente (sin VRT ya que están alineados)
+        data1 = src1.read(1)
+        data2 = src2.read(1)
 
-            data1 = vrt1.read(1)
-            data2 = vrt2.read(1)
-
-            # Aplicar corrección
+        # Aplicar corrección
+        if Con:
             resultado = np.where(data2 > data1, data1, data2)
-
-            # Determinar tipo de dato mínimo necesario
-            dtype_resultado = resultado.dtype.name
-
-            # Metadatos de salida (usamos src2, no el VRT)
-            perfil = src2.profile.copy()
-            perfil.update({
-                'dtype': dtype_resultado,
-                'compress': 'LZW',
-                'predictor': 2 if np.issubdtype(resultado.dtype, np.floating) else 1,
-                'tiled': True,
-                'blockxsize': 256,
-                'blockysize': 256,
-                'BIGTIFF': 'IF_SAFER',
-                'nodata': src2.nodata
-            })
-
-            # Guardar ráster corregido
-            with rasterio.open(salida, 'w', **perfil) as dst:
-                dst.write(resultado, 1)
-
-    print(f"✔️ Raster corregido guardado como: {salida} ({dtype_resultado}, LZW)")
-
-def CheckPixelDepth_BAU_Current(ruta_raster1, ruta_raster2, salida='raster_recortado.tif'):
-    """
-    Compara dos rásteres píxel a píxel. Si raster2 > raster1, reemplaza ese valor por el de raster1.
-    Guarda el resultado con compresión LZW, tipo de dato ajustado automáticamente y bloques optimizados.
-
-    Parámetros:
-        ruta_raster1 (str): Ruta al primer ráster (valor límite superior).
-        ruta_raster2 (str): Ruta al segundo ráster (a corregir si excede).
-        salida (str): Ruta del archivo de salida corregido.
-    """
-
-    with rasterio.open(ruta_raster1) as src1, rasterio.open(ruta_raster2) as src2:
-        # Validación de dimensiones y CRS
-        assert src1.shape == src2.shape, "Los rásteres deben tener la misma dimensión"
-        assert src1.crs == src2.crs, "Los CRS deben coincidir"
-
-        with WarpedVRT(src1, resampling=Resampling.nearest) as vrt1, \
-             WarpedVRT(src2, resampling=Resampling.nearest) as vrt2:
-
-            data1 = vrt1.read(1)
-            data2 = vrt2.read(1)
-
-            # Aplicar corrección
+        else:
             resultado = np.where(data2 < data1, data1, data2)
 
-            # Determinar tipo de dato mínimo necesario
-            dtype_resultado = resultado.dtype.name
+        # Determinar tipo de dato mínimo necesario
+        dtype_resultado = resultado.dtype.name
 
-            # Metadatos de salida (usamos src2, no el VRT)
-            perfil = src2.profile.copy()
-            perfil.update({
-                'dtype': dtype_resultado,
-                'compress': 'LZW',
-                'predictor': 2 if np.issubdtype(resultado.dtype, np.floating) else 1,
-                'tiled': True,
-                'blockxsize': 256,
-                'blockysize': 256,
-                'BIGTIFF': 'IF_SAFER',
-                'nodata': src2.nodata
-            })
+        # Metadatos de salida
+        perfil = src2.profile.copy()
+        perfil.update({
+            'dtype': dtype_resultado,
+            'compress': 'LZW',
+            'predictor': 2 if np.issubdtype(resultado.dtype, np.floating) else 1,
+            'tiled': True,
+            'blockxsize': 256,
+            'blockysize': 256,
+            'BIGTIFF': 'IF_SAFER'
+        })
 
-            # Guardar ráster corregido
-            with rasterio.open(salida, 'w', **perfil) as dst:
-                dst.write(resultado, 1)
+        # Guardar ráster corregido
+        with rasterio.open(salida, 'w', **perfil) as dst:
+            dst.write(resultado, 1)
 
     print(f"✔️ Raster corregido guardado como: {salida} ({dtype_resultado}, LZW)")
+
+
+def CheckVelocity(ruta_raster1, salida='V_out.tif', max_velocity=15.0):
+    """
+    Limita valores de velocidad a un máximo especificado.
+
+    Valores mayores al límite se reemplazan por el valor máximo permitido.
+    Útil para eliminar velocidades físicamente improbables en modelos hidráulicos.
+
+    Parámetros:
+        ruta_raster1 (str): Ruta al raster de velocidad de entrada.
+        salida (str): Ruta del archivo de salida corregido.
+        max_velocity (float): Velocidad máxima permitida en m/s (default: 15.0).
+    """
+    with rasterio.open(ruta_raster1) as src1:
+        # Leer directamente
+        data1 = src1.read(1)
+
+        # Contar píxeles que exceden el límite
+        nodata = src1.nodata
+        if nodata is not None:
+            valid_mask = data1 != nodata
+            excede = np.sum((data1 > max_velocity) & valid_mask)
+        else:
+            excede = np.sum(data1 > max_velocity)
+
+        # Aplicar límite (preservando nodata)
+        resultado = np.where(data1 > max_velocity, max_velocity, data1)
+
+        # Determinar tipo de dato
+        dtype_resultado = resultado.dtype.name
+
+        # Metadatos de salida
+        perfil = src1.profile.copy()
+        perfil.update({
+            'dtype': dtype_resultado,
+            'compress': 'LZW',
+            'predictor': 2 if np.issubdtype(resultado.dtype, np.floating) else 1,
+            'tiled': True,
+            'blockxsize': 256,
+            'blockysize': 256,
+            'BIGTIFF': 'IF_SAFER'
+        })
+
+        # Crear directorio si no existe
+        os.makedirs(os.path.dirname(salida), exist_ok=True)
+
+        # Guardar ráster corregido
+        with rasterio.open(salida, 'w', **perfil) as dst:
+            dst.write(resultado, 1)
+
+    print(f"✔️ Raster de velocidad corregido: {salida}")
+    print(f"   - Tipo de dato: {dtype_resultado}, Compresión: LZW")
+    print(f"   - Píxeles limitados a {max_velocity} m/s: {excede}")
+
+
+def CheckPixelDepth_V2(ruta_raster1, ruta_raster2, ruta_raster3,
+                       salida_current, salida_bau, salida_nbs):
+    """
+    Corrige tres rásteres de profundidad (Current, BaU, NbS) aplicando reglas
+    de coherencia para asegurar que Current ≤ BaU ≤ NbS donde corresponda.
+
+    Reglas aplicadas:
+    - Regla 3: Si Current > BaU > NbS → Current = BaU
+    - Regla 4: Si Current > NbS > BaU → BaU = Current
+    - Regla 5: Si NbS > Current > BaU → BaU = Current, NbS = Current
+    - Regla 6: Si NbS > BaU > Current → NbS = Current
+
+    Parámetros:
+        ruta_raster1 (str): Ruta al raster Current.
+        ruta_raster2 (str): Ruta al raster BaU.
+        ruta_raster3 (str): Ruta al raster NbS.
+        salida_current (str): Ruta de salida para Current corregido.
+        salida_bau (str): Ruta de salida para BaU corregido.
+        salida_nbs (str): Ruta de salida para NbS corregido.
+    """
+
+    with rasterio.open(ruta_raster1) as src1, \
+            rasterio.open(ruta_raster2) as src2, \
+            rasterio.open(ruta_raster3) as src3:
+        # Validación
+        assert src1.shape == src2.shape == src3.shape, "Los rásteres deben tener la misma dimensión"
+        assert src1.crs == src2.crs == src3.crs, "Los CRS deben coincidir"
+
+        # Leer directamente
+        Current = src1.read(1).astype(np.float32)
+        BaU     = src2.read(1).astype(np.float32)
+        NbS     = src3.read(1).astype(np.float32)
+
+        # FILTRADO DE VALORES ATÍPICOS (percentil 99)
+        # Calcular percentil 99 solo con valores > 0 (excluir zonas secas)
+        p99_current = np.percentile(Current[Current > 0], 99) if np.any(Current > 0) else np.inf
+        p99_bau     = np.percentile(BaU[BaU > 0], 99) if np.any(BaU > 0) else np.inf
+        p99_nbs     = np.percentile(NbS[NbS > 0], 99) if np.any(NbS > 0) else np.inf
+
+        print(f"Percentiles 99 calculados:")
+        print(f"  - Current: {p99_current:.4f}")
+        print(f"  - BaU:     {p99_bau:.4f}")
+        print(f"  - NbS:     {p99_nbs:.4f}")
+
+        # Reemplazar valores atípicos con el percentil 99
+        outliers_current    = np.sum(Current > p99_current)
+        outliers_bau        = np.sum(BaU > p99_bau)
+        outliers_nbs        = np.sum(NbS > p99_nbs)
+
+        Current[Current > p99_current] = p99_current
+        BaU[BaU > p99_bau] = p99_bau
+        NbS[NbS > p99_nbs] = p99_nbs
+
+        print(f"\nValores atípicos filtrados:")
+        print(f"  - Current: {outliers_current} píxeles")
+        print(f"  - BaU:     {outliers_bau} píxeles")
+        print(f"  - NbS:     {outliers_nbs} píxeles")
+
+        # APLICAR REGLAS DE COHERENCIA
+        # Regla 3 - Current > BaU > NbS
+        id = (Current > BaU) & (BaU > NbS)
+        Current[id] = BaU[id]
+
+        # Regla 4 - Current > NbS > BaU
+        id = (Current > NbS) & (NbS > BaU)
+        BaU[id] = Current[id]
+        NbS[id] = Current[id]
+
+        # Regla 5 - NbS > Current > BaU
+        id = (NbS > Current) & (Current > BaU)
+        BaU[id] = Current[id]
+        NbS[id] = Current[id]
+
+        # Regla 6 - NbS > BaU > Current
+        id = (NbS > BaU) & (BaU > Current)
+        NbS[id] = Current[id]
+
+        # Determinar tipo de dato
+        dtype_resultado = Current.dtype.name
+
+        # Perfil base
+        perfil_base = {
+            'dtype': dtype_resultado,
+            'compress': 'LZW',
+            'predictor': 2,
+            'tiled': True,
+            'blockxsize': 256,
+            'blockysize': 256,
+            'BIGTIFF': 'IF_SAFER'
+        }
+
+        # Guardar Current corregido
+        perfil_current = src1.profile.copy()
+        perfil_current.update(perfil_base)
+        with rasterio.open(salida_current, 'w', **perfil_current) as dst:
+            dst.write(Current, 1)
+
+        # Guardar BaU corregido
+        perfil_bau = src2.profile.copy()
+        perfil_bau.update(perfil_base)
+        with rasterio.open(salida_bau, 'w', **perfil_bau) as dst:
+            dst.write(BaU, 1)
+
+        # Guardar NbS corregido
+        perfil_nbs = src3.profile.copy()
+        perfil_nbs.update(perfil_base)
+        with rasterio.open(salida_nbs, 'w', **perfil_nbs) as dst:
+            dst.write(NbS, 1)
+
+    print(f"✔️ Rasters corregidos guardados:")
+    print(f"   - Current: {salida_current}")
+    print(f"   - BaU: {salida_bau}")
+    print(f"   - NbS: {salida_nbs}")
+
 
 def Get_Basin_bbox(shp_path):
     '''
@@ -668,7 +791,6 @@ def CommandFastFlood(NameCommand,
     - Si el comando es 'Run', se asume que todos los insumos ya están listos y solo se arma el `-sim`.
     - La función **no ejecuta** el modelo, solo construye el comando.
     """
-    FactorCal = False
 
     # iniciar comando
     Comando = [FastFloodPath]
@@ -740,7 +862,7 @@ def CommandFastFlood(NameCommand,
 
 def RunScenarios(ProjectPath, FastFloodPath, D, P, Q, SSP, TR,
                  DEM_Path, Manning_Path, Inf_Path, BasinPath, D_DS=None, D_DS_CC=None,
-                 log=None, customurl=None, Channel=None, BoundaryCondition=None,IDF_Table=None,StatusExe=True):
+                 log=None, customurl=None, Channel=None, BoundaryCondition=None, IDF_Table=None, StatusExe=True):
 
 
     # Residensial
@@ -820,6 +942,9 @@ def RunScenarios(ProjectPath, FastFloodPath, D, P, Q, SSP, TR,
             ClicRasterWithBasin(H_Path_Tmp, BasinPath, salida=H_Path)
             ClicRasterWithBasin(V_Path_Tmp, BasinPath, salida=V_Path)
             ClicRasterWithBasin(Q_Path_Tmp, BasinPath, salida=Q_Path)
+
+            # Filtro de Velocidades
+            CheckVelocity(V_Path, V_Path)
         #'''
 
     # Guardar Listado de Raster de Profundidad
@@ -902,6 +1027,9 @@ def RunScenarios(ProjectPath, FastFloodPath, D, P, Q, SSP, TR,
             ClicRasterWithBasin(H_Path_Tmp, BasinPath, salida=H_Path)
             ClicRasterWithBasin(V_Path_Tmp, BasinPath, salida=V_Path)
             ClicRasterWithBasin(Q_Path_Tmp, BasinPath, salida=Q_Path)
+
+            # Filtro de Velocidades
+            CheckVelocity(V_Path, V_Path)
         #'''
 
     # Guardar Listado de Raster de Profundidad
@@ -922,13 +1050,13 @@ def RunScenarios(ProjectPath, FastFloodPath, D, P, Q, SSP, TR,
     raster_paths_Q = {}
 
     for TR_i in TR:
-        H_Path = ProjectPath + f'/out/06-FLOOD/Flood/Flood_NbS_TR-{TR_i}_Tmp.tif'
+        H_Path = ProjectPath + f'/out/06-FLOOD/Flood/Flood_NbS_TR-{TR_i}.tif'
         V_Path = ProjectPath + f'/out/06-FLOOD/Velocity/Velocity_NbS_TR-{TR_i}.tif'
         Q_Path = ProjectPath + f'/out/06-FLOOD/Discharge/Qpeak_NbS_TR-{TR_i}.tif'
         TS_Q_Path = ProjectPath + f'/out/06-FLOOD/Discharge/TS_Q_NbS_TR-{TR_i}.csv'
 
         # Crear lista de rasters
-        raster_paths_H[TR_i] = ProjectPath + f'/out/06-FLOOD/Flood/Flood_NbS_TR-{TR_i}.tif'
+        raster_paths_H[TR_i] = H_Path
         raster_paths_V[TR_i] = V_Path
         raster_paths_Q[TR_i] = Q_Path
 
@@ -984,6 +1112,9 @@ def RunScenarios(ProjectPath, FastFloodPath, D, P, Q, SSP, TR,
             ClicRasterWithBasin(H_Path_Tmp, BasinPath, salida=H_Path)
             ClicRasterWithBasin(V_Path_Tmp, BasinPath, salida=V_Path)
             ClicRasterWithBasin(Q_Path_Tmp, BasinPath, salida=Q_Path)
+
+            # Filtro de Velocidades
+            CheckVelocity(V_Path, V_Path)
         #'''
 
     # Guardar Listado de Raster de Profundidad
@@ -1057,6 +1188,7 @@ def TR_Damage(df_profundidad, df_costos, category='Residential'):
 
     # Seguro de maximo 1.0
     #valores_interpolados[valores_interpolados > 1.0] = 1.0
+    valores_interpolados[valores_interpolados > np.max(y)] = np.max(y)
 
     # Reconstruir DataFrame con los mismos índices y columnas
     return pd.DataFrame(valores_interpolados,
@@ -2510,7 +2642,7 @@ def generate_nbs_manning_Old(
             dst.write(manning_final.astype(np.float32), 1)
 
 
-def generate_nbs_manning(
+def generate_nbs_manning_Old(
         lulc_raster: str,                     # Raster LULC base (FastFlood)
         lulc_raster_r_path: str,              # Raster LULC Waterproof (LULC "final")
         nbs_raster: str,                      # Raster con portafolio de NbS
@@ -2647,6 +2779,152 @@ def generate_nbs_manning(
         with rasterio.open(output_path, "w", **meta) as dst:
             dst.write(manning_final.astype(np.float32), 1)
 
+def generate_nbs_manning(
+        lulc_raster: str,                     # Raster LULC base (FastFlood)
+        lulc_raster_r_path: str,              # Raster LULC Waterproof (LULC "final")
+        nbs_raster: str,                      # Raster con portafolio de NbS
+        bau_raster: str,                      # Raster de Manning BaU (sin NbS)
+        manning_current_path: str,            # Raster de Manning del escenario Current
+        output_path: str,                     # Ruta de salida
+        lulc_mapping: Dict[int, float],       # LULC (FastFlood) -> Manning base
+        lulc_fastflood_to_lulc_end: Dict[int, int],  # LULC FastFlood -> LULC final
+        locked_categories: Set[int],          # LULC bloqueados (no modificar)
+        manning_dict: Dict[Tuple[int, int], float],  # (NbS, LULC_final) -> Manning
+        manning_base_path: Optional[str] = None,     # Raster alterno de Manning base
+        use_raster: bool = False,             # Usar manning_base_path en vez de lulc_mapping
+        default_manning: float = np.nan,      # Valor por defecto si falta mapping de Manning
+        default_lulc_final: int = -9999       # Marcador si falta mapping FastFlood->Final
+):
+    """
+    Genera un raster de Manning a partir del escenario BaU y aplica cambios
+    solo donde hay NbS válidas y no bloqueadas, usando manning_dict.
+
+    Notas prácticas:
+    - Evita np.vectorize; usa mapeos por np.unique (más seguro y claro).
+    - Maneja claves faltantes con valores por defecto.
+    - Respeta categorías bloqueadas y nodata de NbS.
+    - Verifica que pixeles con NbS no empeoren vs escenario Current.
+    """
+
+    def apply_dict_map(arr: np.ndarray,
+                       dct: Dict[int, float | int],
+                       default_val,
+                       out_dtype):
+        """
+        Aplica un diccionario a un array entero sin usar loops por pixel.
+        Cualquier clave faltante se mapea a `default_val`.
+        """
+        u, inv = np.unique(arr, return_inverse=True)
+        mapped_u = np.full(u.shape, default_val, dtype=out_dtype)
+        # Rellenar solo donde la clave exista
+        for i, key in enumerate(u):
+            v = dct.get(int(key), None)
+            if v is not None:
+                mapped_u[i] = v
+        return mapped_u[inv].reshape(arr.shape)
+
+    with rasterio.open(lulc_raster) as lulc_src, \
+         rasterio.open(lulc_raster_r_path) as lulc_src_r, \
+         rasterio.open(nbs_raster) as nbs_src, \
+         rasterio.open(bau_raster) as bau_src:
+
+        # Lecturas
+        lulc_ff   = lulc_src.read(1)       # LULC FastFlood
+        lulc_wp   = lulc_src_r.read(1)     # LULC final (Waterproof)
+        nbs_data  = nbs_src.read(1)
+        bau_data  = bau_src.read(1).astype(np.float32)
+
+        # Raster final parte de BaU (regla: celdas sin NbS quedan igual)
+        manning_final = bau_data.copy()
+
+        # Definir presencia de NbS de manera robusta
+        nbs_nodata = nbs_src.nodata
+        if nbs_nodata is None:
+            # Si no hay nodata, considera NbS presentes si > 0 (ajusta a tu codificación)
+            has_nbs = nbs_data > 0
+        else:
+            has_nbs = nbs_data != nbs_nodata
+
+        # Categorías bloqueadas (no tocar)
+        locked_mask = np.isin(lulc_ff, list(locked_categories))
+        not_locked  = ~locked_mask
+
+        # Manning inicial:
+        if use_raster and manning_base_path:
+            with rasterio.open(manning_base_path) as man_src:
+                manning_inicial = man_src.read(1).astype(np.float32)
+        else:
+            # Desde lulc_mapping (LULC FastFlood -> manning base)
+            manning_inicial = apply_dict_map(
+                arr=lulc_ff,
+                dct=lulc_mapping,
+                default_val=np.float32(default_manning),
+                out_dtype=np.float32
+            )
+
+        # TEMP: valores candidatos desde manning_dict[(NbS, LULC_final)]
+        # Primero, mapea FastFlood -> LULC_final donde haga falta
+        # (si ya tienes lulc_wp como "final", úsalo directo; si no, usa el mapping)
+        # Aquí usamos el LULC "final" proveniente de lulc_wp; si necesitas forzar
+        # el mapping de FastFlood->Final, aplica apply_dict_map(lulc_ff, ...)
+        lulc_final = lulc_wp.astype(np.int32)
+
+        # Construir temp_data solo donde haya NbS y no esté bloqueado
+        temp_data = np.full(nbs_data.shape, np.nan, dtype=np.float32)
+        candidate_mask = has_nbs & not_locked
+
+        if np.any(candidate_mask):
+            nbs_vals   = nbs_data[candidate_mask].astype(np.int32)
+            lulc_vals  = lulc_final[candidate_mask].astype(np.int32)
+            temp_flat  = temp_data[candidate_mask]
+
+            # Rellenar temp_flat con los valores de manning_dict cuando exista la clave
+            # (loop sobre candidatos; suele ser suficientemente rápido y claro)
+            for i, (nbs_val, lulc_val) in enumerate(zip(nbs_vals, lulc_vals)):
+                v = manning_dict.get((int(nbs_val), int(lulc_val)), None)
+                if v is not None:
+                    temp_flat[i] = np.float32(v)
+
+            # Escribir de regreso
+            temp_data[candidate_mask] = temp_flat
+
+        # REGLA 1: usar temp si mejora y hay NbS (y no está bloqueado)
+        # Nota: "mejorar" = temp > manning_inicial; ajusta el criterio si hace falta.
+        valid_temp = ~np.isnan(temp_data)
+        cond_temp_greater = valid_temp & candidate_mask & (temp_data > manning_inicial)
+        manning_final[cond_temp_greater] = temp_data[cond_temp_greater]
+
+        # REGLA 2: donde hay NbS y temp válido pero NO mejora, intenta tabla con (NbS, LULC_final)
+        remaining_mask = candidate_mask & valid_temp & (~cond_temp_greater)
+        if np.any(remaining_mask):
+            nbs_flat   = nbs_data[remaining_mask].astype(np.int32)
+            lulc_flat  = lulc_final[remaining_mask].astype(np.int32)
+            base_flat  = manning_inicial[remaining_mask].astype(np.float32)
+
+            final_values = base_flat.copy()
+            for i, (nbs_val, lulc_val) in enumerate(zip(nbs_flat, lulc_flat)):
+                v = manning_dict.get((int(nbs_val), int(lulc_val)), None)
+                if v is not None:
+                    final_values[i] = np.float32(v)
+
+            manning_final[remaining_mask] = final_values
+
+        # REGLA 3: Verificación vs escenario Current
+        # En pixeles con NbS (no bloqueados), si manning_final < current, usar current
+        with rasterio.open(manning_current_path) as curr_src:
+            manning_current = curr_src.read(1).astype(np.float32)
+
+        condition_worse = has_nbs & not_locked & (manning_final < manning_current)
+        manning_final[condition_worse] = manning_current[condition_worse]
+
+        # (Sin NbS) o (bloqueados) -> mantienen BaU ya copiado en manning_final
+
+        # Guardar
+        meta = lulc_src.meta.copy()
+        meta.update(dtype="float32", count=1)
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        with rasterio.open(output_path, "w", **meta) as dst:
+            dst.write(manning_final.astype(np.float32), 1)
 
 def generate_nbs_infiltration(
     lulc_raster: str,  # LULC FastFlood (alineado)
@@ -2690,6 +2968,7 @@ def generate_nbs_infiltration(
                 percentage = infiltration_dict[key] / 100.0  # convertir de 1-100 a 0.01-1.0
                 infiltration_out[idx] = flat_base[idx] * (1 + percentage)
 
+        #'''
         temp_data = infiltration_out.reshape(nbs_data.shape)
 
         # Máscaras
@@ -2718,6 +2997,7 @@ def generate_nbs_infiltration(
                     final_values[idx] = base_flat[idx] * (1 + percentage)
 
             infiltration_final[remaining_mask] = final_values
+        #'''
 
         # Guardar raster final
         meta = lulc_src.meta.copy()
@@ -2841,7 +3121,7 @@ def Indicators_BaU_NBS(PathProject):
 
     Results.to_csv(os.path.join(PathProject, 'out', 'OUTPUTS-Indicators.csv'),index=False)
 
-def BashFastFlood(JSONPath):
+def BashFastFlood(JSONPath, SaveFullCSV=False):
 
     # ------------------------------------------------------------------------------------------------------------------
     # Leer JSON con parámetros de ejecución
@@ -2908,6 +3188,7 @@ def BashFastFlood(JSONPath):
     # ------------------------------------------------------------------------------------------------------------------
     # Crear rasters de n-Manning para BaU
     # ------------------------------------------------------------------------------------------------------------------
+    # '''
     generate_manning_bau(
         aligned["lulc_fastflood"],
         aligned["bau_lulc"],
@@ -2922,11 +3203,13 @@ def BashFastFlood(JSONPath):
     # Check - Los n-Manning en el BaU nunca deben ser mayor que el Current
     n_H     = os.path.join(ProjectPath, "in", "06-FLOOD", "Raster", "Manning.tif")
     n_BaU   = os.path.join(ProjectPath, "in", "06-FLOOD", "Raster", "Manning_BaU.tif")
-    CheckPixelDepth_BAU_NBS(n_H, n_BaU, n_BaU)
+    CheckPixelDepth(n_H, n_BaU, n_BaU)
+    #'''
 
     # ------------------------------------------------------------------------------------------------------------------
     # Crear rasters de infiltración para BaU
     # ------------------------------------------------------------------------------------------------------------------
+    # '''
     generate_infiltracion_bau(
         aligned["lulc_fastflood"],
         aligned["waterproof_current"],
@@ -2940,26 +3223,34 @@ def BashFastFlood(JSONPath):
     # Check - La Infiltración en el BaU nunca debe ser mayor que el Current
     n_H     = os.path.join(ProjectPath, "in", "06-FLOOD", "Raster", "Infiltration.tif")
     n_BaU   = os.path.join(ProjectPath, "in", "06-FLOOD", "Raster", "Infiltration_BaU.tif")
-    CheckPixelDepth_BAU_NBS(n_H, n_BaU, n_BaU)
+    CheckPixelDepth(n_H, n_BaU, n_BaU)
+    #'''
 
     # ------------------------------------------------------------------------------------------------------------------
     # Crear rasters de n-Manning para SbN
     # ------------------------------------------------------------------------------------------------------------------
+    # '''
     generate_nbs_manning(
-        aligned["lulc_fastflood"],  # LULC FastFlood (alineado)
+        aligned["lulc_fastflood"],  #    LULC FastFlood (alineado)
         aligned["waterproof_current"],  # LULC waterproof (alineado)
         aligned["portafolio"],  # Portafolio (alineado)
-        os.path.join(ProjectPath, "in", "06-FLOOD", "Raster", "Manning_BaU.tif"),  # Manning Bau (alineado)
+        os.path.join(ProjectPath, "in", "06-FLOOD", "Raster", "Manning_BaU.tif"), # Manning Bau (alineado)
+        os.path.join(ProjectPath, "in", "06-FLOOD", "Raster", "Manning.tif"), # Current
         os.path.join(ProjectPath, "in", "06-FLOOD", "Raster", "Manning_NbS.tif"),
         lulc_to_manning,
         lulc_fastflood_to_lulc_end,
         locked_categories,
         manning_dict,
     )
-
+    # Check - Los n-Manning de NbS nunca deben ser menores que el BaU
+    n_BaU   = os.path.join(ProjectPath, "in", "06-FLOOD", "Raster", "Manning_BaU.tif")
+    n_NbS   = os.path.join(ProjectPath, "in", "06-FLOOD", "Raster", "Manning_NbS.tif")
+    CheckPixelDepth(n_BaU, n_NbS, n_NbS, Con=False)
+    #'''
     # ------------------------------------------------------------------------------------------------------------------
     # Crear rasters de infiltración para SbN
     # ------------------------------------------------------------------------------------------------------------------
+    # '''
     generate_nbs_infiltration(aligned["lulc_fastflood"],  # LULC FastFlood (alineado)
                               aligned["waterproof_current"],  # LULC waterproof (alineado)
                               aligned["portafolio"],  # Portafolio (alineado)
@@ -2971,6 +3262,11 @@ def BashFastFlood(JSONPath):
                               infiltracion_dict,
                               )
 
+    # Check - La Infiltración en el BaU nunca debe ser mayor que el Current
+    n_NbS   = os.path.join(ProjectPath, "in", "06-FLOOD", "Raster", "Infiltration_NbS.tif")
+    n_BaU   = os.path.join(ProjectPath, "in", "06-FLOOD", "Raster", "Infiltration_BaU.tif")
+    CheckPixelDepth(n_BaU, n_NbS, n_NbS, Con=False)
+    #'''
     # ------------------------------------------------------------------------------------------------------------------
     # Recortar raster de usos del suelo para daños
     # ------------------------------------------------------------------------------------------------------------------
@@ -3079,31 +3375,33 @@ def BashFastFlood(JSONPath):
                              BasinPath=UserData['CatchmentPath'],
                              Channel=Channel,
                              BoundaryCondition=BoundaryCondition,
-                             log=log, IDF_Table=None, StatusExe=True)
-    # df_idf
-    # ------------------------------------------------------------------------------------------------------------------
-    # Check - Se verifica que las profundidades del escenario BaU nunca sean menores que las del escenario Current.
-    # ------------------------------------------------------------------------------------------------------------------
-    # '''
+                             log=log, IDF_Table=df_idf, StatusExe=True)
+    #
     for TR_i in UserData["ClimateParams"]["ReturnPeriod"]:
-        H_Path_H   = ProjectPath + f'/out/06-FLOOD/Flood/Flood_Current_TR-{TR_i}.tif'
+        H_Path_H = ProjectPath + f'/out/06-FLOOD/Flood/Flood_Current_TR-{TR_i}.tif'
         H_Path_BaU = ProjectPath + f'/out/06-FLOOD/Flood/Flood_BaU_TR-{TR_i}.tif'
-        # Check
-        CheckPixelDepth_BAU_Current(H_Path_H, H_Path_BaU, H_Path_BaU)
-    # '''
+        H_Path_NbS = ProjectPath + f'/out/06-FLOOD/Flood/Flood_NbS_TR-{TR_i}.tif'
 
-    # ------------------------------------------------------------------------------------------------------------------
-    # Check - Se verifica que las profundidades del escenario NbS nunca sean mayores que las del escenario BaU.
-    # ------------------------------------------------------------------------------------------------------------------
-    #'''
-    for TR_i in UserData["ClimateParams"]["ReturnPeriod"]:
-        H_Path_BaU = ProjectPath + f'/out/06-FLOOD/Flood/Flood_BaU_TR-{TR_i}.tif'
-        H_Path_NbS = ProjectPath + f'/out/06-FLOOD/Flood/Flood_NbS_TR-{TR_i}_Tmp.tif'
-        H_Path_New = ProjectPath + f'/out/06-FLOOD/Flood/Flood_NbS_TR-{TR_i}.tif'
-        # Check
-        CheckPixelDepth_BAU_NBS(H_Path_BaU, H_Path_NbS, H_Path_New)
-        # Remover el raster temporal
-        os.remove(H_Path_NbS )
+        CheckPixelDepth_V2(H_Path_H, H_Path_BaU, H_Path_NbS, H_Path_H, H_Path_BaU, H_Path_NbS)
+
+    # '''
+    # # ------------------------------------------------------------------------------------------------------------------
+    # # Check - Se verifica que las profundidades del escenario BaU nunca sean menores que las del escenario Current.
+    # # ------------------------------------------------------------------------------------------------------------------
+    # for TR_i in UserData['ClimateParams']['ReturnPeriod']:
+    #     H_Path_H   = ProjectPath + f'/out/06-FLOOD/Flood/Flood_Current_TR-{TR_i}.tif'
+    #     H_Path_BaU = ProjectPath + f'/out/06-FLOOD/Flood/Flood_BaU_TR-{TR_i}.tif'
+    #     # Check
+    #     CheckPixelDepth(H_Path_BaU, H_Path_H, H_Path_H)
+    #
+    # # ------------------------------------------------------------------------------------------------------------------
+    # # Check - Se verifica que las profundidades del escenario NbS nunca sean mayores que las del escenario BaU.
+    # # ------------------------------------------------------------------------------------------------------------------
+    # for TR_i in UserData['ClimateParams']['ReturnPeriod']:
+    #     H_Path_BaU = ProjectPath + f'/out/06-FLOOD/Flood/Flood_BaU_TR-{TR_i}.tif'
+    #     H_Path_NbS = ProjectPath + f'/out/06-FLOOD/Flood/Flood_NbS_TR-{TR_i}.tif'
+    #     # Check
+    #     CheckPixelDepth(H_Path_BaU, H_Path_NbS, H_Path_NbS)
     # '''
 
     # ------------------------------------------------------------------------------------------------------------------
@@ -3112,7 +3410,6 @@ def BashFastFlood(JSONPath):
     log.write("# ---------------------------------------------------------------------------------------------------\n")
     log.write(f"# Estimate of expected annual damage for each scenario \n")
     log.write("# ---------------------------------------------------------------------------------------------------\n")
-    #'''
 
     # Leer curvas de daño
     DC = ReadDamageCurve(ProjectPath=os.path.join(UserData['ProjectPath'],UserData["NameBasinFolder"]))
@@ -3186,7 +3483,8 @@ def BashFastFlood(JSONPath):
             # log.write(f"Read flood depth for the {Sce} scenario for {Cat} damages category- Ok \n")
 
             df = df_H[df_H['Code'].isin(CodeLULC[Cat])]
-            df.to_csv( f'{UserData["ProjectPath"]}/{UserData["NameBasinFolder"]}/out/06-FLOOD/Flood/H_{Cat}_{Sce}.csv', index=False)
+            if SaveFullCSV:
+                df.to_csv( f'{UserData["ProjectPath"]}/{UserData["NameBasinFolder"]}/out/06-FLOOD/Flood/H_{Cat}_{Sce}.csv', index=False)
             log.write(f"Read flood depth for the {Sce} scenario for {Cat} damages category- Ok \n")
 
             # ----------------------------------------------------------------------------------------------------------
@@ -3196,7 +3494,8 @@ def BashFastFlood(JSONPath):
                 df.drop('Code', axis=1, inplace=True)
 
             df = TR_Damage(df, DC, category=Cat)*FactorArea[Cat]
-            # df.to_csv(f'{UserData["ProjectPath"]}/{UserData["NameBasinFolder"]}/out/06-FLOOD/Damages/01-Damage_{Cat}_{Sce}.csv', index=False)
+            if SaveFullCSV:
+                df.to_csv(f'{UserData["ProjectPath"]}/{UserData["NameBasinFolder"]}/out/06-FLOOD/Damages/01-Damage_{Cat}_{Sce}.csv', index=False)
             log.write(f"Damage estimation for each return period of the {Sce} scenario {Cat} - Ok \n")
 
             # ----------------------------------------------------------------------------------------------------------
@@ -3204,7 +3503,8 @@ def BashFastFlood(JSONPath):
             # ----------------------------------------------------------------------------------------------------------
             # Este factor corresponde a la división de área
             OutEAD = EAD(TR=UserData['ClimateParams']['ReturnPeriod'], Damage=df, NameCol=Cat)
-            # OutEAD.to_csv(os.path.join(ProjectPath, 'out', '06-FLOOD', 'Damages', f'02-Expected_Annual_Damage_{Cat}_{Sce}.csv'))
+            if SaveFullCSV:
+                OutEAD.to_csv(os.path.join(ProjectPath, 'out', '06-FLOOD', 'Damages', f'02-Expected_Annual_Damage_{Cat}_{Sce}.csv'))
             log.write(f"Estimated annual expected damages for the {Sce} scenario for {Cat} damages category- Ok- Ok \n")
 
             # Agregar datos
