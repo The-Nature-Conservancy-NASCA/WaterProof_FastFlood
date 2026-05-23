@@ -20,7 +20,9 @@
 import datetime
 import glob
 import json
+import logging
 import os
+import psutil
 import subprocess
 import sys
 import tempfile
@@ -94,6 +96,149 @@ import os
 import time
 
 warnings.filterwarnings('ignore')
+
+# ============================================================================
+# CONFIGURACIÓN DE LOGGER
+# ============================================================================
+
+def setup_logger(name='FastFlood', log_file=None, level=logging.INFO):
+    """
+    Configura un logger para tracking de operaciones de FastFlood.
+
+    Parameters
+    ----------
+    name : str
+        Nombre del logger (default: 'FastFlood')
+    log_file : str, optional
+        Ruta del archivo de log. Si es None, solo se muestra en consola.
+    level : logging level
+        Nivel de logging (default: logging.INFO)
+
+    Returns
+    -------
+    logging.Logger
+        Logger configurado
+    """
+    logger = logging.getLogger(name)
+
+    # Evitar duplicar handlers si ya existe
+    if logger.handlers:
+        return logger
+
+    logger.setLevel(level)
+
+    # Formato detallado con timestamp, nivel, función y mensaje
+    formatter = logging.Formatter(
+        '[%(asctime)s] %(levelname)-8s [%(funcName)s:%(lineno)d] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    # Handler para consola
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(level)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
+    # Handler para archivo si se especificó
+    if log_file:
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
+        file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+        file_handler.setLevel(level)
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+
+    return logger
+
+def get_memory_usage():
+    """
+    Obtiene el uso de memoria del proceso actual.
+
+    Returns
+    -------
+    dict
+        Diccionario con memoria RSS, VMS y porcentaje de uso
+    """
+    try:
+        process = psutil.Process()
+        mem_info = process.memory_info()
+        mem_percent = process.memory_percent()
+
+        return {
+            'rss_mb': mem_info.rss / 1024 / 1024,  # Resident Set Size (RAM real)
+            'vms_mb': mem_info.vms / 1024 / 1024,  # Virtual Memory Size
+            'percent': mem_percent
+        }
+    except Exception as e:
+        return {'rss_mb': 0, 'vms_mb': 0, 'percent': 0, 'error': str(e)}
+
+def log_memory(logger, message="", level=logging.INFO):
+    """
+    Log con información de uso de memoria actual.
+
+    Parameters
+    ----------
+    logger : logging.Logger
+        Logger a utilizar
+    message : str
+        Mensaje adicional a incluir
+    level : logging level
+        Nivel de log
+    """
+    mem = get_memory_usage()
+    if 'error' in mem:
+        logger.log(level, f"{message} [Memory tracking error: {mem['error']}]")
+    else:
+        logger.log(
+            level,
+            f"{message} [RAM: {mem['rss_mb']:.1f} MB | {mem['percent']:.1f}%]"
+        )
+
+def log_array_info(logger, array, name="Array", level=logging.DEBUG):
+    """
+    Log con información detallada de un numpy array.
+
+    Parameters
+    ----------
+    logger : logging.Logger
+        Logger a utilizar
+    array : numpy.ndarray
+        Array a analizar
+    name : str
+        Nombre descriptivo del array
+    level : logging level
+        Nivel de log
+    """
+    if array is None:
+        logger.log(level, f"{name}: None")
+        return
+
+    size_mb = array.nbytes / 1024 / 1024
+    logger.log(
+        level,
+        f"{name}: shape={array.shape}, dtype={array.dtype}, size={size_mb:.2f} MB"
+    )
+
+# Crear logger global del módulo
+_module_logger = None
+
+def get_module_logger(log_file=None):
+    """
+    Obtiene o crea el logger global del módulo.
+
+    Parameters
+    ----------
+    log_file : str, optional
+        Ruta del archivo de log
+
+    Returns
+    -------
+    logging.Logger
+        Logger del módulo
+    """
+    global _module_logger
+    if _module_logger is None:
+        _module_logger = setup_logger('FastFlood', log_file=log_file)
+    return _module_logger
 
 # === Otros (no utilizados explícitamente o dudosos) ===
 # from numpy.core._multiarray_umath import ndarray  # innecesario, ya viene con numpy
@@ -1836,11 +1981,311 @@ def Raster2Zonal(profundidades, shapefile_mascara=None, Threshold_H=0.01):
     resultado = resultado.fillna(0)
     return resultado
 
+def Raster2DataFrame_Damages_Chunked(ruta_cobertura, profundidades, codigos_cobertura, shapefile_mascara=None,
+                                     Threshold_H=0.01, verbose=True, log_file=None, chunk_size=2048):
+    """
+    Versión optimizada que procesa rásteres por chunks para evitar OOM.
+
+    Procesa el raster de cobertura por ventanas (chunks) en lugar de cargarlo completo en memoria,
+    reduciendo consumo de RAM de ~10 GB a chunks de ~100-500 MB.
+
+    Parameters
+    ----------
+    chunk_size : int, optional
+        Tamaño del chunk en píxeles (default: 2048x2048)
+    """
+    import rasterio.windows
+
+    logger = get_module_logger(log_file=log_file)
+    logger.info("="*80)
+    logger.info("INICIANDO Raster2DataFrame_Damages_Chunked (optimizado)")
+    log_memory(logger, "Memoria inicial")
+
+    if verbose:
+        print(f"Procesamiento optimizado por chunks ({chunk_size}x{chunk_size} píxeles)")
+        print(f"Ráster de cobertura: {ruta_cobertura}")
+
+    logger.info(f"Raster de cobertura: {ruta_cobertura}")
+    logger.info(f"Chunk size: {chunk_size}x{chunk_size}")
+
+    # Convertir profundidades a diccionario si es string
+    if isinstance(profundidades, str):
+        profundidades = {'Profundidad': profundidades}
+
+    if verbose:
+        print(f"Procesando {len(profundidades)} rásteres de profundidad")
+
+    # Abrir raster de cobertura (solo metadatos, no leer datos)
+    logger.info("Abriendo raster de cobertura (solo metadatos)...")
+    with rasterio.open(ruta_cobertura) as src_cov:
+        crs_objetivo = src_cov.crs
+        transform = src_cov.transform
+        shape = src_cov.shape
+        height, width = shape
+
+        logger.info(f"CRS: {crs_objetivo}, Dimensiones: {width} x {height} pixeles")
+
+        # Leer shapefile de máscara (opcional)
+        geometria_mask = None
+        if shapefile_mascara:
+            logger.info(f"Procesando shapefile de mascara: {shapefile_mascara}")
+            gdf = gpd.read_file(shapefile_mascara)
+            if not isinstance(gdf, gpd.GeoDataFrame) or 'geometry' not in gdf:
+                raise ValueError("El archivo proporcionado no es un shapefile válido con geometría.")
+            gdf = gdf.to_crs(crs_objetivo)
+            geometria_mask = gdf.geometry
+
+        # Lista para acumular resultados de todos los chunks
+        chunk_results = []
+        total_pixels_found = 0
+
+        # Calcular número de chunks
+        n_chunks_x = (width + chunk_size - 1) // chunk_size
+        n_chunks_y = (height + chunk_size - 1) // chunk_size
+        total_chunks = n_chunks_x * n_chunks_y
+
+        logger.info(f"Procesando {total_chunks} chunks ({n_chunks_y} filas x {n_chunks_x} columnas)")
+        if verbose:
+            print(f"Total de chunks a procesar: {total_chunks}")
+
+        chunk_num = 0
+
+        # Iterar sobre chunks
+        for row_offset in range(0, height, chunk_size):
+            for col_offset in range(0, width, chunk_size):
+                chunk_num += 1
+
+                # Definir ventana del chunk
+                win_height = min(chunk_size, height - row_offset)
+                win_width = min(chunk_size, width - col_offset)
+                window = rasterio.windows.Window(col_offset, row_offset, win_width, win_height)
+
+                logger.debug(f"Chunk {chunk_num}/{total_chunks}: offset=({row_offset},{col_offset}), size=({win_height},{win_width})")
+                log_memory(logger, f"ANTES de procesar chunk {chunk_num}/{total_chunks}")
+
+                # Leer datos de cobertura del chunk
+                cov_data_chunk = src_cov.read(1, window=window)
+                log_array_info(logger, cov_data_chunk, f"cov_data_chunk[{chunk_num}]", level=logging.DEBUG)
+
+                # Transform del chunk
+                chunk_transform = rasterio.windows.transform(window, transform)
+
+                # Generar máscara espacial para el chunk si hay geometría
+                if geometria_mask is not None and geometria_mask.notna().any():
+                    mascara_geo_chunk = geometry_mask(
+                        geometries=geometria_mask,
+                        transform=chunk_transform,
+                        invert=True,
+                        out_shape=(win_height, win_width)
+                    )
+                else:
+                    mascara_geo_chunk = np.ones((win_height, win_width), dtype=bool)
+
+                # Máscara por códigos de cobertura (operación crítica, pero solo en chunk pequeño)
+                mascara_cod_chunk = np.isin(cov_data_chunk, codigos_cobertura)
+                mascara_total_chunk = mascara_cod_chunk & mascara_geo_chunk
+
+                # Índices válidos en el chunk
+                filas_chunk, columnas_chunk = np.where(mascara_total_chunk)
+
+                if len(filas_chunk) == 0:
+                    # No hay píxeles válidos en este chunk, continuar
+                    logger.debug(f"Chunk {chunk_num}: 0 pixeles validos, saltando")
+                    del cov_data_chunk, mascara_geo_chunk, mascara_cod_chunk, mascara_total_chunk
+                    continue
+
+                valores_cobertura_chunk = cov_data_chunk[filas_chunk, columnas_chunk]
+                total_pixels_found += len(filas_chunk)
+
+                logger.debug(f"Chunk {chunk_num}: {len(filas_chunk)} pixeles validos encontrados")
+
+                # Crear DataFrame para este chunk
+                df_chunk = pd.DataFrame({'Code': valores_cobertura_chunk})
+
+                # Procesar cada raster de profundidad
+                for nombre_columna, ruta in profundidades.items():
+                    with rasterio.open(ruta) as src_prof:
+                        with WarpedVRT(
+                                src_prof,
+                                crs=crs_objetivo,
+                                transform=chunk_transform,
+                                width=win_width,
+                                height=win_height,
+                                resampling=Resampling.nearest
+                        ) as vrt_prof:
+                            prof_data_chunk = vrt_prof.read(1)
+                            valores_prof_chunk = prof_data_chunk[filas_chunk, columnas_chunk]
+                            df_chunk[nombre_columna] = valores_prof_chunk
+                            del prof_data_chunk, valores_prof_chunk
+
+                # Agregar a resultados
+                chunk_results.append(df_chunk)
+
+                # Liberar memoria del chunk
+                del cov_data_chunk, mascara_geo_chunk, mascara_cod_chunk, mascara_total_chunk
+                del filas_chunk, columnas_chunk, valores_cobertura_chunk, df_chunk
+
+                log_memory(logger, f"DESPUES de procesar chunk {chunk_num}/{total_chunks}")
+
+                if verbose and chunk_num % 10 == 0:
+                    print(f"Progreso: {chunk_num}/{total_chunks} chunks ({total_pixels_found:,} píxeles válidos)")
+
+    # Concatenar todos los chunks
+    logger.info(f"Concatenando {len(chunk_results)} chunks...")
+    log_memory(logger, "ANTES de concatenar chunks")
+
+    if not chunk_results:
+        logger.warning("No se encontraron pixeles validos en ningún chunk")
+        return pd.DataFrame()
+
+    df = pd.concat(chunk_results, ignore_index=True)
+    del chunk_results
+
+    log_memory(logger, "DESPUES de concatenar chunks")
+    logger.info(f"DataFrame combinado: {len(df):,} filas")
+
+    # Aplicar threshold
+    logger.info(f"Aplicando threshold minimo: {Threshold_H} m")
+    columnas_prof = list(profundidades.keys())
+    for col in columnas_prof:
+        df[col] = np.where(df[col] < Threshold_H, 0, df[col])
+
+    # Eliminar filas donde todas las profundidades son cero
+    filas_iniciales = len(df)
+    df = df[df[columnas_prof].sum(axis=1) != 0]
+
+    logger.info(f"Filas eliminadas (profundidad=0): {filas_iniciales - len(df):,}")
+    logger.info(f"DataFrame final: {len(df):,} filas x {len(df.columns)} columnas")
+    log_memory(logger, "Memoria final")
+
+    if verbose:
+        print(f"Píxeles válidos totales: {total_pixels_found:,}")
+        print(f"DataFrame final: {len(df):,} filas × {len(df.columns)} columnas")
+        print("Procesamiento completado exitosamente")
+
+    logger.info("COMPLETADO Raster2DataFrame_Damages_Chunked exitosamente")
+    logger.info("="*80)
+
+    return df
+
+
+def Raster2DataFrame_Damages_Generator(ruta_cobertura, profundidades, codigos_cobertura,
+                                        shapefile_mascara=None, Threshold_H=0.01,
+                                        verbose=True, log_file=None, chunk_size=2048):
+    """
+    Generador que procesa rásteres por chunks, yielding cada chunk como DataFrame.
+
+    Mismo algoritmo que Raster2DataFrame_Damages_Chunked pero sin acumular en memoria.
+    Threshold y filtro de ceros se aplican por chunk antes del yield.
+
+    Yields
+    ------
+    DataFrame
+        Chunk con columnas [Code, TR_1, TR_2, ...] para píxeles válidos del chunk.
+    """
+    import rasterio.windows
+
+    logger = get_module_logger(log_file=log_file)
+    logger.info("="*80)
+    logger.info(f"INICIANDO Raster2DataFrame_Damages_Generator: {ruta_cobertura}")
+    log_memory(logger, "Memoria inicial")
+
+    if isinstance(profundidades, str):
+        profundidades = {'Profundidad': profundidades}
+
+    with rasterio.open(ruta_cobertura) as src_cov:
+        crs_objetivo = src_cov.crs
+        transform = src_cov.transform
+        height, width = src_cov.shape
+
+        geometria_mask = None
+        if shapefile_mascara:
+            gdf = gpd.read_file(shapefile_mascara)
+            if not isinstance(gdf, gpd.GeoDataFrame) or 'geometry' not in gdf:
+                raise ValueError("El archivo proporcionado no es un shapefile válido con geometría.")
+            gdf = gdf.to_crs(crs_objetivo)
+            geometria_mask = gdf.geometry
+
+        n_chunks_x = (width  + chunk_size - 1) // chunk_size
+        n_chunks_y = (height + chunk_size - 1) // chunk_size
+        total_chunks = n_chunks_x * n_chunks_y
+        chunk_num = 0
+
+        logger.info(f"Dimensiones: {width}x{height} px | Chunks: {total_chunks} ({n_chunks_y}x{n_chunks_x})")
+
+        for row_offset in range(0, height, chunk_size):
+            for col_offset in range(0, width, chunk_size):
+                chunk_num += 1
+                win_height = min(chunk_size, height - row_offset)
+                win_width  = min(chunk_size, width  - col_offset)
+                window = rasterio.windows.Window(col_offset, row_offset, win_width, win_height)
+
+                cov_data_chunk  = src_cov.read(1, window=window)
+                chunk_transform = rasterio.windows.transform(window, transform)
+
+                if geometria_mask is not None and geometria_mask.notna().any():
+                    mascara_geo_chunk = geometry_mask(
+                        geometries=geometria_mask,
+                        transform=chunk_transform,
+                        invert=True,
+                        out_shape=(win_height, win_width)
+                    )
+                else:
+                    mascara_geo_chunk = np.ones((win_height, win_width), dtype=bool)
+
+                mascara_cod_chunk   = np.isin(cov_data_chunk, codigos_cobertura)
+                mascara_total_chunk = mascara_cod_chunk & mascara_geo_chunk
+                filas_chunk, columnas_chunk = np.where(mascara_total_chunk)
+
+                if len(filas_chunk) == 0:
+                    del cov_data_chunk, mascara_geo_chunk, mascara_cod_chunk, mascara_total_chunk
+                    continue
+
+                valores_cobertura_chunk = cov_data_chunk[filas_chunk, columnas_chunk]
+                df_chunk = pd.DataFrame({'Code': valores_cobertura_chunk})
+
+                for nombre_columna, ruta in profundidades.items():
+                    with rasterio.open(ruta) as src_prof:
+                        with WarpedVRT(
+                            src_prof,
+                            crs=crs_objetivo,
+                            transform=chunk_transform,
+                            width=win_width,
+                            height=win_height,
+                            resampling=Resampling.nearest
+                        ) as vrt_prof:
+                            prof_data_chunk = vrt_prof.read(1)
+                            df_chunk[nombre_columna] = prof_data_chunk[filas_chunk, columnas_chunk]
+                            del prof_data_chunk
+
+                # Threshold y filtro de ceros por chunk
+                columnas_prof = list(profundidades.keys())
+                for col in columnas_prof:
+                    df_chunk[col] = np.where(df_chunk[col] < Threshold_H, 0, df_chunk[col])
+                df_chunk = df_chunk[df_chunk[columnas_prof].sum(axis=1) != 0].reset_index(drop=True)
+
+                del cov_data_chunk, mascara_geo_chunk, mascara_cod_chunk, mascara_total_chunk
+                del filas_chunk, columnas_chunk, valores_cobertura_chunk
+
+                if df_chunk.empty:
+                    continue
+
+                logger.debug(f"Chunk {chunk_num}/{total_chunks}: {len(df_chunk)} píxeles válidos")
+                log_memory(logger, f"chunk {chunk_num}/{total_chunks}")
+
+                yield df_chunk
+
+    logger.info("COMPLETADO Raster2DataFrame_Damages_Generator")
+    logger.info("="*80)
+
+
 def Raster2DataFrame_Damages(ruta_cobertura, profundidades, codigos_cobertura, shapefile_mascara=None, Threshold_H=0.01,
-                             verbose=True):
+                             verbose=True, log_file=None):
     """
     Extrae profundidades de uno o varios rásteres en las coordenadas de cobertura seleccionadas,
     limitando opcionalmente con un shapefile de máscara en WGS84.
+
+    NOTA: Esta función ahora usa internamente procesamiento por chunks para evitar OOM.
 
     Esta función permite analizar múltiples escenarios de inundación extrayendo valores de profundidad
     del mismo píxel espacial desde diferentes rásteres. Cada fila del DataFrame resultante representa
@@ -1914,28 +2359,76 @@ def Raster2DataFrame_Damages(ruta_cobertura, profundidades, codigos_cobertura, s
     FileNotFoundError
         Si alguna de las rutas de rásteres no existe.
     """
+    # Redirigir a la versión optimizada por chunks
+    logger = get_module_logger(log_file=log_file)
+    logger.info("Raster2DataFrame_Damages: Usando implementacion optimizada por chunks")
+
+    return Raster2DataFrame_Damages_Chunked(
+        ruta_cobertura=ruta_cobertura,
+        profundidades=profundidades,
+        codigos_cobertura=codigos_cobertura,
+        shapefile_mascara=shapefile_mascara,
+        Threshold_H=Threshold_H,
+        verbose=verbose,
+        log_file=log_file,
+        chunk_size=2048  # 2048x2048 píxeles por chunk (~16 MB para uint8, ~64 MB para float32)
+    )
+
+
+def Raster2DataFrame_Damages_OLD(ruta_cobertura, profundidades, codigos_cobertura, shapefile_mascara=None, Threshold_H=0.01,
+                             verbose=True, log_file=None):
+    """
+    VERSIÓN ANTIGUA (sin optimización de chunks) - Mantenida para referencia.
+    Carga el raster completo en memoria - PUEDE CAUSAR OOM EN RASTERS GRANDES.
+
+    NO USAR EN PRODUCCIÓN - Solo para debugging/comparación.
+    """
+    # Configurar logger
+    logger = get_module_logger(log_file=log_file)
+    logger.info("="*80)
+    logger.info("INICIANDO Raster2DataFrame_Damages_OLD (sin optimizar - NO USAR)")
+    logger.warning("Esta version carga el raster completo en memoria y puede causar OOM")
+    log_memory(logger, "Memoria inicial")
+
     if verbose:
+        print("⚠️  ADVERTENCIA: Usando version NO optimizada")
         print("Iniciando procesamiento de rásteres de daños por inundación...")
         print(f"Ráster de cobertura: {ruta_cobertura}")
+
+    logger.info(f"Raster de cobertura: {ruta_cobertura}")
 
     if isinstance(profundidades, str):
         profundidades = {'Profundidad': profundidades}
         if verbose:
             print(f"Procesando 1 ráster de profundidad: {profundidades['Profundidad']}")
+        logger.info(f"Procesando 1 raster de profundidad")
     else:
         if verbose:
             print(f"Procesando {len(profundidades)} rásteres de profundidad:")
             for nombre, ruta in profundidades.items():
                 print(f"  - {nombre}: {ruta}")
+        logger.info(f"Procesando {len(profundidades)} rasters de profundidad")
+        for nombre, ruta in profundidades.items():
+            logger.debug(f"  - {nombre}: {ruta}")
 
     # Abrir ráster de cobertura y guardar su CRS, shape y transform
     if verbose:
         print("Leyendo ráster de cobertura...")
+    logger.info("Leyendo raster de cobertura...")
+    log_memory(logger, "Antes de leer cobertura")
+
     with rasterio.open(ruta_cobertura) as src_cov:
         crs_objetivo = src_cov.crs
         transform = src_cov.transform
         shape = src_cov.shape
+        logger.info(f"CRS: {crs_objetivo}, Dimensiones: {shape[1]} x {shape[0]} pixeles")
+
+        # Leer datos de cobertura
+        logger.info("Cargando datos de cobertura en memoria...")
         cov_data = src_cov.read(1)
+        log_array_info(logger, cov_data, "cov_data")
+        log_memory(logger, "Después de cargar cobertura")
+
         if verbose:
             print(f"  - CRS: {crs_objetivo}")
             print(f"  - Dimensiones: {shape[1]} x {shape[0]} píxeles")
@@ -1945,11 +2438,14 @@ def Raster2DataFrame_Damages(ruta_cobertura, profundidades, codigos_cobertura, s
     if shapefile_mascara:
         if verbose:
             print(f"Procesando shapefile de máscara: {shapefile_mascara}")
+        logger.info(f"Procesando shapefile de mascara: {shapefile_mascara}")
         gdf = gpd.read_file(shapefile_mascara)
         if not isinstance(gdf, gpd.GeoDataFrame) or 'geometry' not in gdf:
+            logger.error("Shapefile invalido - no contiene geometria")
             raise ValueError("El archivo proporcionado no es un shapefile válido con geometría.")
         gdf = gdf.to_crs(crs_objetivo)
         geometria_mask = gdf.geometry
+        logger.info(f"Shapefile reproyectado a {crs_objetivo}")
         if verbose:
             print(f"  - Shapefile reproyectado a {crs_objetivo}")
 
@@ -1957,26 +2453,51 @@ def Raster2DataFrame_Damages(ruta_cobertura, profundidades, codigos_cobertura, s
     if geometria_mask is not None and geometria_mask.notna().any():
         if verbose:
             print("Creando máscara espacial...")
+        logger.info("Creando mascara espacial...")
+        log_memory(logger, "Antes de crear mascara geometrica")
+
         mascara_geo = geometry_mask(
             geometries=geometria_mask,
             transform=transform,
             invert=True,
             out_shape=shape
         )
+
+        log_array_info(logger, mascara_geo, "mascara_geo")
+        log_memory(logger, "Despues de crear mascara geometrica")
     else:
         mascara_geo = np.ones(shape, dtype=bool)
+        logger.info("Sin mascara espacial - procesando toda el area")
         if verbose:
             print("Sin máscara espacial - procesando toda el área")
 
     # Máscara por códigos de cobertura
     if verbose:
         print(f"Aplicando filtro por códigos de cobertura: {codigos_cobertura}")
+
+    logger.info(f"Aplicando filtro por codigos de cobertura: {codigos_cobertura}")
+    log_memory(logger, "ANTES de crear mascara_cod (np.isin)")
+
     mascara_cod = np.isin(cov_data, codigos_cobertura)
+
+    log_array_info(logger, mascara_cod, "mascara_cod")
+    log_memory(logger, "DESPUES de crear mascara_cod")
+
+    logger.info("Combinando mascaras (mascara_cod & mascara_geo)...")
     mascara_total = mascara_cod & mascara_geo
 
+    log_array_info(logger, mascara_total, "mascara_total")
+    log_memory(logger, "Despues de combinar mascaras")
+
     # Índices válidos
+    logger.info("Extrayendo indices validos con np.where...")
+    log_memory(logger, "ANTES de np.where(mascara_total)")
+
     filas, columnas = np.where(mascara_total)
     valores_cobertura = cov_data[filas, columnas]
+
+    logger.info(f"Pixeles validos encontrados: {len(filas):,}")
+    log_memory(logger, "DESPUES de np.where - indices extraidos")
 
     if verbose:
         print(f"Píxeles válidos encontrados: {len(filas):,}")
@@ -1984,16 +2505,34 @@ def Raster2DataFrame_Damages(ruta_cobertura, profundidades, codigos_cobertura, s
         print("Distribución por código de cobertura:")
         for codigo, count in codigo_counts.items():
             print(f"  - Código {codigo}: {count:,} píxeles")
+            logger.debug(f"Codigo {codigo}: {count:,} pixeles")
 
     # DataFrame base
+    logger.info("Creando DataFrame base...")
+    log_memory(logger, "ANTES de crear DataFrame base")
+
     df = pd.DataFrame({'Code': valores_cobertura})
 
+    logger.info(f"DataFrame creado con {len(df):,} filas")
+    log_memory(logger, "DESPUES de crear DataFrame base")
+
     # Cargar cada capa de profundidad reproyectada y remuestreada al grid del ráster de cobertura
+    logger.info(f"Iniciando loop de procesamiento de {len(profundidades)} rasters de profundidad")
+
     for i, (nombre_columna, ruta) in enumerate(profundidades.items(), 1):
         if verbose:
             print(f"Procesando ráster {i}/{len(profundidades)}: {nombre_columna}")
 
+        logger.info(f"[{i}/{len(profundidades)}] Procesando raster: {nombre_columna}")
+        logger.debug(f"  Ruta: {ruta}")
+        log_memory(logger, f"ANTES de abrir raster {i}")
+
         with rasterio.open(ruta) as src_prof:
+            logger.debug(f"  Raster abierto: CRS={src_prof.crs}, shape={src_prof.shape}")
+
+            logger.info(f"  Creando WarpedVRT para {nombre_columna}...")
+            log_memory(logger, f"ANTES de WarpedVRT {i}")
+
             with WarpedVRT(
                     src_prof,
                     crs=crs_objetivo,
@@ -2002,30 +2541,68 @@ def Raster2DataFrame_Damages(ruta_cobertura, profundidades, codigos_cobertura, s
                     height=shape[0],
                     resampling=Resampling.nearest
             ) as vrt_prof:
+                logger.info(f"  Leyendo datos de {nombre_columna}...")
+                log_memory(logger, f"ANTES de vrt_prof.read(1) - Raster {i}")
+
                 prof_data = vrt_prof.read(1)  # solo banda 1
+
+                log_array_info(logger, prof_data, f"prof_data[{nombre_columna}]")
+                log_memory(logger, f"DESPUES de leer prof_data - Raster {i}")
+
+                logger.info(f"  Extrayendo valores en indices validos...")
                 valores_prof = prof_data[filas, columnas]
+
+                logger.info(f"  Agregando columna '{nombre_columna}' al DataFrame...")
                 df[nombre_columna] = valores_prof
+
+                log_memory(logger, f"DESPUES de agregar columna al DataFrame - Raster {i}")
 
                 if verbose:
                     stats = pd.Series(valores_prof)
                     print(f"  - Rango de valores: {stats.min():.3f} - {stats.max():.3f}")
                     print(f"  - Valores > {Threshold_H}: {(stats > Threshold_H).sum():,} píxeles")
+                    logger.debug(f"  Rango: {stats.min():.3f} - {stats.max():.3f}, >threshold: {(stats > Threshold_H).sum():,}")
+
+                # Liberar memoria explícitamente
+                del prof_data
+                del valores_prof
+
+                log_memory(logger, f"Despues de liberar prof_data y valores_prof - Raster {i}")
+
+    logger.info("Loop de rasters completado")
 
     # Aplicar threshold a columnas de profundidad
     if verbose:
         print(f"Aplicando umbral mínimo de profundidad: {Threshold_H} m")
+
+    logger.info(f"Aplicando threshold minimo de profundidad: {Threshold_H} m")
+    log_memory(logger, "ANTES de aplicar threshold")
+
     columnas_prof = list(profundidades.keys())
     for col in columnas_prof:
         df[col] = np.where(df[col] < Threshold_H, 0, df[col])
 
+    log_memory(logger, "DESPUES de aplicar threshold")
+
     # Eliminar filas donde todas las profundidades son cero
     filas_iniciales = len(df)
+    logger.info(f"Eliminando filas con todas profundidades = 0...")
+    log_memory(logger, "ANTES de filtrar filas con sum=0")
+
     df = df[df[columnas_prof].sum(axis=1) != 0]
+
+    logger.info(f"Filas eliminadas: {filas_iniciales - len(df):,}")
+    logger.info(f"DataFrame final: {len(df):,} filas x {len(df.columns)} columnas")
+    log_memory(logger, "DataFrame final")
 
     if verbose:
         print(f"Filas eliminadas (todas profundidades = 0): {filas_iniciales - len(df):,}")
         print(f"DataFrame final: {len(df):,} filas × {len(df.columns)} columnas")
         print("Procesamiento completado exitosamente.")
+
+    logger.info("COMPLETADO Raster2DataFrame_Damages exitosamente")
+    log_memory(logger, "Memoria final antes de retornar")
+    logger.info("="*80)
 
     return df
 
@@ -2161,99 +2738,138 @@ def Clic_Mosaic_DataBase(carpeta_tiles, aoi_path, ruta_salida, crs_salida=None, 
         raise RuntimeError("❌ Ningún tile intersecta el AOI")
     if verbose: print(f"D. Tiles filtrados: {len(bbox_df_filt)} en {time.perf_counter() - t0:.2f} s")
 
-    # === E. Recorte individual por tile ===
+    # === E. Construir lista de tiles a procesar ===
     t0 = time.perf_counter()
-    recortes = []
+    tiles_list = []
     for _, row in bbox_df_filt.iterrows():
         path_tile = os.path.join(carpeta_tiles, row["tile"])
-        try:
-            with rasterio.open(path_tile) as src:
-                if src.crs != crs_tiles:
-                    raise ValueError("Todos los tiles deben tener el mismo CRS")
-                out_image, out_transform = rasterio.mask.mask(src, [mapping(geom_proj)], crop=True)
-                out_meta = src.meta.copy()
-                out_meta.update({
-                    "height": out_image.shape[1],
-                    "width": out_image.shape[2],
-                    "transform": out_transform
-                })
-                recortes.append((out_image, out_meta))
-        except Exception:
-            continue
-    if verbose: print(f"E. Recortes individuales: {len(recortes)} en {time.perf_counter() - t0:.2f} s")
+        if os.path.exists(path_tile):
+            tiles_list.append(path_tile)
 
-    # === F. Fusionar recortes ===
+    if not tiles_list:
+        raise RuntimeError("❌ No se encontraron tiles válidos")
+    if verbose: print(f"E. Tiles a procesar: {len(tiles_list)} en {time.perf_counter() - t0:.2f} s")
+
+    # === F. Crear VRT (Virtual Raster) y fusionar con GDAL Warp ===
     t0 = time.perf_counter()
-    datasets_virtuales = []
-    for img, meta in recortes:
-        mem = MemoryFile()
-        ds = mem.open(**meta)
-        ds.write(img)
-        datasets_virtuales.append(ds)
 
-    from rasterio.merge import merge
-    mosaic, transform = merge(datasets_virtuales)
-    meta_final = recortes[0][1].copy()
-    meta_final.update({
-        "height": mosaic.shape[1],
-        "width": mosaic.shape[2],
-        "transform": transform
-    })
+    # Crear VRT temporal en memoria
+    vrt_path = tempfile.NamedTemporaryFile(suffix='.vrt', delete=False).name
+    try:
+        # BuildVRT crea un mosaico virtual sin cargar datos en RAM
+        vrt_options = gdal.BuildVRTOptions(
+            resolution='highest',
+            resampleAlg='nearest'
+        )
+        vrt_ds = gdal.BuildVRT(vrt_path, tiles_list, options=vrt_options)
+        if vrt_ds is None:
+            raise RuntimeError("❌ Error creando VRT")
+        vrt_ds = None  # Cerrar para liberar
 
-    # === F.1 Aplicar recorte exacto si se especifica ===
-    if recorte_exacto and geom_original_proj is not None:
-        if verbose: print(f"F.1. Aplicando recorte exacto...")
-        t1 = time.perf_counter()
+        if verbose: print(f"F.1. VRT creado: {len(tiles_list)} tiles fusionados")
 
-        # Crear un dataset temporal en memoria para aplicar la máscara
-        temp_meta = meta_final.copy()
-        temp_meta.update({"crs": crs_tiles})
+        # Preparar opciones de Warp
+        os.makedirs(os.path.dirname(ruta_salida), exist_ok=True)
 
-        with MemoryFile() as memfile:
-            with memfile.open(**temp_meta) as temp_ds:
-                temp_ds.write(mosaic)
-                # Aplicar la máscara con la geometría exacta
-                mosaic_masked, transform_masked = rasterio.mask.mask(
-                    temp_ds,
-                    [mapping(geom_original_proj)],
-                    crop=True,
-                    nodata=0
+        warp_options = {
+            'format': 'GTiff',
+            'creationOptions': ['COMPRESS=LZW', 'TILED=YES', 'BIGTIFF=IF_SAFER'],
+            'dstNodata': 0,
+            'resampleAlg': gdal.GRA_NearestNeighbour,
+            'multithread': True,
+            'warpMemoryLimit': 512  # Limitar memoria de warp a 512 MB
+        }
+
+        # Intentar recorte exacto si está habilitado
+        cutline_path = None
+        cutline_applied = False
+
+        if recorte_exacto and geom_original_proj is not None:
+            cutline_path = tempfile.NamedTemporaryFile(suffix='.shp', delete=False).name
+            try:
+                # Crear GeoDataFrame con la geometría y el CRS correcto
+                gdf = gpd.GeoDataFrame(
+                    {'geometry': [geom_original_proj]},
+                    crs=crs_tiles
                 )
 
-                # Actualizar metadatos con las nuevas dimensiones
-                meta_final.update({
-                    "height": mosaic_masked.shape[1],
-                    "width": mosaic_masked.shape[2],
-                    "transform": transform_masked,
-                    "nodata": 0
-                })
+                # Guardar como shapefile temporal (incluye .prj con CRS)
+                gdf.to_file(cutline_path, driver='ESRI Shapefile')
 
-                mosaic = mosaic_masked
-                transform = transform_masked
+                # Agregar cutline a las opciones
+                # El CRS se infiere automáticamente del archivo .prj del shapefile
+                warp_options['cutlineDSName'] = cutline_path
+                warp_options['cropToCutline'] = True
+                warp_options['cutlineBlend'] = 0
+                cutline_applied = True
 
-        if verbose: print(f"     Recorte exacto completado en {time.perf_counter() - t1:.2f} s")
+                if verbose: print(f"F.2. Aplicando recorte exacto con geometría...")
+            except Exception as e:
+                if verbose: print(f"⚠️ Advertencia: No se pudo crear cutline: {e}")
+                if verbose: print(f"    Usando recorte rectangular como fallback...")
+                cutline_path = None
+                cutline_applied = False
 
-    if crs_salida and CRS.from_user_input(crs_salida) != crs_tiles:
-        meta_final.update({"crs": crs_salida})
-    else:
-        meta_final.update({"crs": crs_tiles})
-    if verbose: print(f"F. Unión final en {time.perf_counter() - t0:.2f} s")
+        # Si no se aplicó recorte exacto, usar recorte rectangular
+        if not cutline_applied:
+            minx, miny, maxx, maxy = geom_proj.bounds
+            warp_options['outputBounds'] = [minx, miny, maxx, maxy]
+            if verbose and recorte_exacto: print(f"F.2. Usando recorte rectangular (bounds)")
+            elif verbose: print(f"F.2. Recorte rectangular aplicado")
 
-    # === G. Guardar salida ===
+        # Aplicar CRS de salida si se especificó
+        if crs_salida:
+            warp_options['dstSRS'] = crs_salida
+
+        # Ejecutar Warp (fusiona + recorta en streaming, sin cargar todo en RAM)
+        warp_opts = gdal.WarpOptions(**warp_options)
+        result_ds = gdal.Warp(ruta_salida, vrt_path, options=warp_opts)
+
+        if result_ds is None:
+            raise RuntimeError("❌ Error en gdal.Warp")
+
+        result_ds = None  # Cerrar dataset
+
+        # Limpiar archivos de cutline si se creó (shapefile genera múltiples archivos)
+        if cutline_path:
+            try:
+                # Eliminar todos los archivos del shapefile (.shp, .shx, .dbf, .prj, .cpg)
+                base_path = os.path.splitext(cutline_path)[0]
+                for ext in ['.shp', '.shx', '.dbf', '.prj', '.cpg']:
+                    file_to_delete = base_path + ext
+                    if os.path.exists(file_to_delete):
+                        os.unlink(file_to_delete)
+            except:
+                pass
+
+        if verbose: print(f"F. Fusión y recorte completados en {time.perf_counter() - t0:.2f} s")
+
+    finally:
+        # Limpiar VRT temporal
+        if os.path.exists(vrt_path):
+            try:
+                os.unlink(vrt_path)
+            except:
+                pass
+
+    # === G. Optimizar tipo de datos del archivo final ===
     t0 = time.perf_counter()
-    min_val, max_val = mosaic.min(), mosaic.max()
-    dtype = 'uint8' if max_val <= 255 else 'uint16' if max_val <= 65535 else 'int32'
-    meta_final.update({
-        "driver": "GTiff",
-        "compress": "LZW",
-        "tiled": True,
-        "BIGTIFF": "IF_SAFER",
-        "dtype": dtype
-    })
-    os.makedirs(os.path.dirname(ruta_salida), exist_ok=True)
-    with rasterio.open(ruta_salida, "w", **meta_final) as dest:
-        dest.write(mosaic)
-    if verbose: print(f"G. Escritura en {time.perf_counter() - t0:.2f} s")
+    try:
+        with rasterio.open(ruta_salida, 'r+') as dst:
+            # Leer estadísticas sin cargar todo el raster
+            stats = dst.statistics(1)
+            max_val = stats.max
+
+            # Determinar dtype óptimo
+            current_dtype = dst.dtypes[0]
+            optimal_dtype = 'uint8' if max_val <= 255 else 'uint16' if max_val <= 65535 else 'int32'
+
+            if verbose and current_dtype != optimal_dtype:
+                print(f"G. Tipo de datos: {current_dtype} (rango 0-{max_val:.0f})")
+    except Exception as e:
+        if verbose: print(f"⚠️ No se pudo optimizar dtype: {e}")
+
+    if verbose: print(f"G. Escritura verificada en {time.perf_counter() - t0:.2f} s")
 
     print(f"⏱️ Tiempo total: {time.perf_counter() - start_total:.2f} s")
     if recorte_exacto:
@@ -3121,6 +3737,643 @@ def Indicators_BaU_NBS(PathProject):
 
     Results.to_csv(os.path.join(PathProject, 'out', 'OUTPUTS-Indicators.csv'),index=False)
 
+"""
+# ------------------------------------------------------------------------------------------------------------------
+Detecta y reconstruye hidrogramas SCS dañados por errores numéricos.
+
+Uso:
+    correct_hydrographs(folder, dem_path)
+
+Parámetros:
+    folder       : ruta a la carpeta con los CSV y rasters de descarga
+    dem_path     : ruta al DEM de la cuenca (se procesa solo si no hay TRs válidos)
+    min_valid_trs: TRs válidos mínimos para usar regresión (default 2)
+    n_default    : parámetro n fijo cuando no hay TRs válidos (default 13.5)
+
+Retorna None. Reemplaza in-place los TR invalidos y escribe diagnosticos en '_diagnostics/'.
+# ------------------------------------------------------------------------------------------------------------------
+"""
+
+import os
+import shutil
+import warnings
+import numpy as np
+import pandas as pd
+import rasterio
+from rasterio.warp import reproject, Resampling
+from rasterio.windows import from_bounds as _window_from_bounds
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+from scipy.optimize import minimize
+
+warnings.filterwarnings('ignore')
+
+SCENARIOS = ['BaU', 'Current', 'NbS']
+TRS = [2, 5, 10, 20, 40, 50, 100, 200, 500, 1000]
+
+COL_TIME = 'time (hour)'
+COL_Q    = 'discharge (m3/s)'
+
+
+# ---------------------------------------------------------------------------
+# Fórmulas y estadísticas
+# ---------------------------------------------------------------------------
+
+def scs_q(t: np.ndarray, qp: float, tp: float, n: float) -> np.ndarray:
+    """
+    Hidrograma Unitario Sintético SCS normalizado (Williams & Hann 1973).
+    Garantiza q = qp exactamente en t = tp.
+
+    t  : array de tiempo (h)
+    qp : caudal pico (m³/s)
+    tp : tiempo al pico (h)
+    n  : parámetro de forma (n > 1)
+    Returns array de caudal (m³/s).
+    """
+    r = np.clip(t / tp, 1e-12, None)
+    return qp * (r ** (n - 1.0)) * np.exp((n - 1.0) * (1.0 - r))
+
+
+def r2_score(y: np.ndarray, y_hat: np.ndarray) -> float:
+    """Coeficiente de determinación R²."""
+    ss_tot = np.sum((y - y.mean()) ** 2)
+    return 0.0 if ss_tot == 0 else float(1.0 - np.sum((y - y_hat) ** 2) / ss_tot)
+
+
+def hydrograph_stats(df: pd.DataFrame) -> tuple:
+    """
+    Extrae tp, Qp y duración de un hidrograma.
+
+    df : DataFrame con columnas [time (hour), discharge (m3/s)]
+    Returns (tp_h, qp_m3s, duration_h).
+    """
+    t = df[COL_TIME].values
+    q = df[COL_Q].values
+    idx = int(np.argmax(q))
+    tp, qp = float(t[idx]), float(q[idx])
+    above = np.where(q > 0.01 * qp)[0]
+    duration = float(t[above[-1]]) if above.size else float(t[-1])
+    return tp, qp, duration
+
+
+def has_plateau(q: np.ndarray, tol_rel: float = 1e-4) -> bool:
+    """True si el pico persiste más de 2 pasos de tiempo consecutivos."""
+    qp = q.max()
+    at_peak = np.abs(q - qp) < tol_rel * qp
+    streak = 0
+    for v in at_peak:
+        streak = streak + 1 if v else 0
+        if streak > 2:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Validación
+# ---------------------------------------------------------------------------
+
+def validate_triplet(stats: dict, raw_q: dict) -> tuple:
+    """
+    Valida reglas de orden y unicidad para un TR.
+
+    stats : {escenario: (tp, qp, duration)}
+    raw_q : {escenario: array de caudal}
+    Returns (is_valid: bool, reason: str).
+    """
+    tp = {sc: stats[sc][0] for sc in SCENARIOS}
+    qp = {sc: stats[sc][1] for sc in SCENARIOS}
+    reasons = []
+
+    if tp['BaU'] >= tp['Current']:
+        reasons.append(
+            f"tp_BaU({tp['BaU']:.2f}h) >= tp_Current({tp['Current']:.2f}h)"
+        )
+    if tp['BaU'] >= tp['NbS']:
+        reasons.append(
+            f"tp_BaU({tp['BaU']:.2f}h) >= tp_NbS({tp['NbS']:.2f}h)"
+        )
+    if tp['NbS'] >= tp['Current']:
+        reasons.append(
+            f"tp_NbS({tp['NbS']:.2f}h) >= tp_Current({tp['Current']:.2f}h)"
+        )
+
+    if len({round(v, 3) for v in qp.values()}) < 3:
+        reasons.append(
+            "Qp no únicos: " + ", ".join(f"{sc}={qp[sc]:.3f}" for sc in SCENARIOS)
+        )
+
+    for sc in SCENARIOS:
+        if has_plateau(raw_q[sc]):
+            reasons.append(f"Plateau en pico: {sc}")
+
+    return len(reasons) == 0, "; ".join(reasons)
+
+
+# ---------------------------------------------------------------------------
+# Calibración de n
+# ---------------------------------------------------------------------------
+def calibrate_n(t: np.ndarray, q_obs: np.ndarray,
+                qp: float, tp: float, n0: float = 3.0) -> tuple:
+    """
+    Calibra n del HUS SCS vía Nelder-Mead minimizando SSE.
+
+    t, q_obs : serie temporal observada
+    qp, tp   : caudal y tiempo al pico fijos
+    n0       : valor inicial de n
+    Returns (n_optimo, RMSE).
+    """
+    def objective(params):
+        n = params[0]
+        if n <= 1.001:
+            return 1e12
+        return float(np.sum((scs_q(t, qp, tp, n) - q_obs) ** 2))
+
+    res = minimize(
+        objective, [n0], method='Nelder-Mead',
+        options={'xatol': 1e-6, 'fatol': 1e-6, 'maxiter': 3000, 'disp': False}
+    )
+    n_opt = max(float(res.x[0]), 1.001)
+    rmse = float(np.sqrt(np.mean((scs_q(t, qp, tp, n_opt) - q_obs) ** 2)))
+    return n_opt, rmse
+
+
+# ---------------------------------------------------------------------------
+# Regresión
+# ---------------------------------------------------------------------------
+
+def fit_regression(x: np.ndarray, y: np.ndarray) -> dict:
+    """
+    Ajusta regresiones lineal, potencial y exponencial. Retorna la mejor por R².
+
+    x, y : arrays 1D de datos
+    Returns dict con: type, params, r2, predict (callable x -> y).
+    """
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    best: dict = {'type': None, 'params': [], 'r2': -np.inf, 'predict': None}
+
+    def _try(label, params, y_hat, fn):
+        r2 = r2_score(y, y_hat)
+        if r2 > best['r2']:
+            best.update(type=label, params=list(params), r2=r2, predict=fn)
+
+    # Linear: y = a*x + b
+    a, b = np.polyfit(x, y, 1)
+    _try('linear', [a, b], a * x + b,
+         lambda xx, a=a, b=b: a * np.asarray(xx, float) + b)
+
+    # Power: y = a*x^b  (x>0, y>0)
+    if np.all(x > 0) and np.all(y > 0):
+        bp, la = np.polyfit(np.log(x), np.log(y), 1)
+        ap = np.exp(la)
+        _try('power', [ap, bp], ap * x ** bp,
+             lambda xx, a=ap, b=bp: a * np.asarray(xx, float) ** b)
+
+    # Exponential: y = a*exp(b*x)  (y>0)
+    if np.all(y > 0):
+        be, la = np.polyfit(x, np.log(y), 1)
+        ae = np.exp(la)
+        _try('exponential', [ae, be], ae * np.exp(be * x),
+             lambda xx, a=ae, b=be: a * np.exp(b * np.asarray(xx, float)))
+
+    return best
+
+
+# ---------------------------------------------------------------------------
+# Lectura de rasters
+# ---------------------------------------------------------------------------
+
+def get_qpeak_raster(folder: str, scenario: str, tr: int) -> float:
+    """
+    Lee el maximo pixel valido del raster de caudal pico.
+
+    Returns Qp (m3/s).
+    """
+    path = os.path.join(folder, f"Qpeak_{scenario}_TR-{tr}.tif")
+    with rasterio.open(path) as src:
+        data = src.read(1).astype(float)
+        nd = src.nodata
+        if nd is not None:
+            data = data[data != nd]
+        data = data[np.isfinite(data) & (data > 0)]
+        return float(data.max())
+
+
+# ---------------------------------------------------------------------------
+# Tiempo de concentración (D8 disk-based + Kirpich) — mínima huella de RAM
+# ---------------------------------------------------------------------------
+
+def compute_tc_kirpich(dem_path: str, mask_raster: str) -> tuple:
+    """
+    Estima tiempo de concentracion (h) por Kirpich.
+    L = distancia maxima entre pixeles del borde de la mascara de cuenca.
+    S = (Hmax - Hmin) / L
+
+    dem_path    : DEM (puede ser mas grande que mask_raster)
+    mask_raster : raster Qpeak — define extension y mascara de cuenca
+    Returns (tc, L_m, S).
+    """
+    from scipy.ndimage import binary_erosion
+    from scipy.spatial import ConvexHull
+
+    # --- Qpeak: bounds y mascara ---
+    with rasterio.open(mask_raster) as msk:
+        bounds   = msk.bounds
+        msk_data = msk.read(1).astype(np.float32)
+        nd_mask  = msk.nodata
+        msk_tf   = msk.transform
+        msk_crs  = msk.crs
+
+    # --- DEM clip ventana sobre extent del Qpeak ---
+    with rasterio.open(dem_path) as dem_src:
+        win     = _window_from_bounds(
+            bounds.left, bounds.bottom, bounds.right, bounds.top,
+            transform=dem_src.transform,
+        )
+        dem_raw = dem_src.read(1, window=win).astype(np.float32)
+        dem_tf  = dem_src.window_transform(win)
+        dem_nd  = dem_src.nodata
+        dem_crs = dem_src.crs
+        res     = float(abs(float(dem_tf.a)))
+
+    rows, cols = dem_raw.shape
+
+    # --- Reproyectar mascara Qpeak al grid del DEM ---
+    valid_src = np.ones_like(msk_data, dtype=np.int32)
+    if nd_mask is not None:
+        valid_src[msk_data == nd_mask] = 0
+    valid_src[~np.isfinite(msk_data) | (msk_data <= 0)] = 0
+    del msk_data
+
+    ws = np.zeros((rows, cols), dtype=np.int32)
+    reproject(
+        source=valid_src, destination=ws,
+        src_transform=msk_tf, src_crs=msk_crs,
+        dst_transform=dem_tf, dst_crs=dem_crs,
+        resampling=Resampling.nearest,
+    )
+    mask = ws.astype(bool)
+    del ws, valid_src
+
+    # --- DEM enmascarado ---
+    if dem_nd is not None:
+        dem_raw[dem_raw == np.float32(dem_nd)] = np.nan
+    dem_raw[~mask] = np.nan
+
+    # --- Hmax, Hmin ---
+    valid_elev = dem_raw[mask & np.isfinite(dem_raw)]
+    H_max = float(valid_elev.max())
+    H_min = float(valid_elev.min())
+    del valid_elev, dem_raw
+
+    # --- Borde de la mascara ---
+    eroded = binary_erosion(mask, structure=np.ones((3, 3), dtype=bool))
+    border = mask & ~eroded
+    del eroded
+
+    br, bc = np.where(border)
+    del border
+
+    # Coordenadas fisicas (metros) en columna=x, fila=y
+    pts = np.column_stack([bc.astype(np.float64) * res,
+                           br.astype(np.float64) * res])
+
+    # Convex hull reduce a O(sqrt(n)) vertices; diametro siempre en hull
+    if len(pts) >= 3:
+        hull = ConvexHull(pts)
+        pts  = pts[hull.vertices]
+
+    # Par mas distante entre vertices del hull
+    max_d2 = 0.0
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            d2 = (pts[i, 0] - pts[j, 0])**2 + (pts[i, 1] - pts[j, 1])**2
+            if d2 > max_d2:
+                max_d2 = d2
+    L = max(float(np.sqrt(max_d2)), res)
+
+    S  = max((H_max - H_min) / L, 0.001)
+    tc = 0.000325 * (L ** 0.77) * (S ** (-0.385))
+    return tc, L, S
+
+
+# ---------------------------------------------------------------------------
+# Plots
+# ---------------------------------------------------------------------------
+
+def _plot_hydrographs(diag: str, all_data: dict, reconstructed: dict,
+                      valid_trs: list, invalid_trs: list) -> None:
+    plots_dir = os.path.join(diag, 'plots')
+    os.makedirs(plots_dir, exist_ok=True)
+
+    tr_colors = plt.cm.get_cmap('tab10')
+
+    for sc in SCENARIOS:
+        fig, ax = plt.subplots(figsize=(12, 5))
+
+        for i, tr in enumerate(valid_trs):
+            df = all_data[sc][tr]
+            ax.plot(df[COL_TIME], df[COL_Q], color=tr_colors(i),
+                    lw=1.5, label=f'TR-{tr} original')
+
+        for i, tr in enumerate(invalid_trs):
+            color = tr_colors(len(valid_trs) + i)
+            df_dmg = all_data[sc][tr]
+            ax.plot(df_dmg[COL_TIME], df_dmg[COL_Q],
+                    color='grey', lw=0.8, ls=':', alpha=0.6,
+                    label=f'TR-{tr} dañado')
+            if (sc, tr) in reconstructed:
+                t_r, q_r = reconstructed[(sc, tr)]
+                ax.plot(t_r, q_r, color=color,
+                        lw=1.5, ls='--', label=f'TR-{tr} reconstruido')
+
+        ax.set_xlabel('Tiempo (h)')
+        ax.set_ylabel('Caudal (m3/s)')
+        ax.set_title(f'Hidrogramas — {sc}  (gris punteado = original dañado)')
+        ax.legend(fontsize=6, ncol=3, loc='upper right')
+        ax.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(os.path.join(plots_dir, f'hydrographs_{sc}.png'), dpi=150)
+        plt.close(fig)
+
+
+def _plot_regressions(diag: str, regressions: dict, reg_data: dict) -> None:
+    plots_dir = os.path.join(diag, 'plots')
+    os.makedirs(plots_dir, exist_ok=True)
+
+    fn_keys = ['f1_tp', 'f2_duration', 'f3_n']
+    ylabels = ['tp (h)', 'Duracion (h)', 'n']
+    fig, axes = plt.subplots(3, 3, figsize=(13, 10))
+
+    for j, sc in enumerate(SCENARIOS):
+        qp_pts = np.array([d['qp'] for d in reg_data[sc]])
+        y_pts = {
+            'f1_tp':       np.array([d['tp']       for d in reg_data[sc]]),
+            'f2_duration': np.array([d['duration']  for d in reg_data[sc]]),
+            'f3_n':        np.array([d['n']         for d in reg_data[sc]]),
+        }
+        for i, (fk, yl) in enumerate(zip(fn_keys, ylabels)):
+            ax = axes[i][j]
+            reg = regressions[sc][fk]
+            x_line = np.linspace(qp_pts.min() * 0.8, qp_pts.max() * 1.2, 200)
+            ax.scatter(qp_pts, y_pts[fk], color='black', zorder=5, s=40)
+            ax.plot(x_line, reg['predict'](x_line), 'b-', lw=1.5)
+            ax.set_title(
+                f'{sc} — {fk}\n({reg["type"]}, R²={reg["r2"]:.3f})', fontsize=8
+            )
+            ax.set_xlabel('Qp (m3/s)', fontsize=7)
+            ax.set_ylabel(yl, fontsize=7)
+            ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(os.path.join(plots_dir, 'regressions.png'), dpi=150)
+    plt.close(fig)
+
+
+def correct_hydrographs(
+    folder: str,
+    dem_path: str,
+    min_valid_trs: int = 2,
+    n_default: float = 13.5,
+) -> None:
+    """
+    Detecta y reconstruye hidrogramas SCS dañados por errores numéricos.
+
+    folder       : ruta con TS_Q_*.csv y Qpeak_*.tif
+    dem_path     : ruta al DEM de la cuenca (se procesa solo si no hay TRs válidos)
+    min_valid_trs: TRs válidos mínimos para usar regresión (default 2)
+    n_default    : parámetro n fijo cuando no hay TRs válidos (default 13.5)
+    Escribe:
+        TS_Q_{SC}_TR-{TR}.csv  (reemplaza originals de TR invalidos)
+        _diagnostics/_originals_backup/
+        _diagnostics/01_validation.csv
+        _diagnostics/02_n_calibrated.csv   (casos 2 y normal)
+        _diagnostics/03_regressions.csv    (solo caso normal)
+        _diagnostics/04_reconstruction.csv
+        _diagnostics/plots/
+    """
+    diag = os.path.join(folder, '_diagnostics')
+    os.makedirs(diag, exist_ok=True)
+    backup = os.path.join(diag, '_originals_backup')
+    os.makedirs(backup, exist_ok=True)
+    for sc in SCENARIOS:
+        for tr in TRS:
+            name = f'TS_Q_{sc}_TR-{tr}.csv'
+            dst = os.path.join(backup, name)
+            if not os.path.exists(dst):
+                shutil.copy2(os.path.join(folder, name), dst)
+
+    # ------------------------------------------------------------------
+    # 1. Cargar todos los CSV
+    # ------------------------------------------------------------------
+    all_data: dict = {sc: {} for sc in SCENARIOS}
+    for sc in SCENARIOS:
+        for tr in TRS:
+            path = os.path.join(folder, f'TS_Q_{sc}_TR-{tr}.csv')
+            all_data[sc][tr] = pd.read_csv(path)
+
+    n_points = max(len(all_data[sc][tr]) for sc in SCENARIOS for tr in TRS)
+
+    # ------------------------------------------------------------------
+    # 2. Calcular estadísticas y validar por TR
+    # ------------------------------------------------------------------
+    stats: dict = {}
+    val_rows = []
+    valid_trs, invalid_trs = [], []
+
+    for tr in TRS:
+        stats[tr] = {}
+        raw_q = {}
+        for sc in SCENARIOS:
+            df = all_data[sc][tr]
+            tp, qp, dur = hydrograph_stats(df)
+            stats[tr][sc] = (tp, qp, dur)
+            raw_q[sc] = df[COL_Q].values
+
+        is_valid, reason = validate_triplet(stats[tr], raw_q)
+        (valid_trs if is_valid else invalid_trs).append(tr)
+
+        for sc in SCENARIOS:
+            tp, qp, dur = stats[tr][sc]
+            t_last = float(all_data[sc][tr][COL_TIME].iloc[-1])
+            val_rows.append({
+                'TR': tr, 'scenario': sc,
+                'tp_h': round(tp, 4),
+                'Qp_m3s': round(qp, 4),
+                'duration_h': round(dur, 4),
+                'time_end_h': round(t_last, 4),
+                'valid': is_valid,
+                'reason': reason,
+            })
+
+    pd.DataFrame(val_rows).to_csv(
+        os.path.join(diag, '01_validation.csv'), index=False
+    )
+    print(f"TRs válidos   : {valid_trs}")
+    print(f"TRs inválidos : {invalid_trs}")
+
+    # ------------------------------------------------------------------
+    # Case 1: todos válidos
+    # ------------------------------------------------------------------
+    if not invalid_trs:
+        print("Todos los hidrogramas son válidos. Sin cambios.")
+        return
+
+    # ------------------------------------------------------------------
+    # Determinar modo de reconstrucción
+    # ------------------------------------------------------------------
+    fixed_params = None   # {sc: (tp, dur, n)} — None = usar regresiones
+    regressions = None
+    reg_data = None
+
+    if not valid_trs:
+        # Case 3: ningún TR válido — parámetros sintéticos desde DEM
+        mask_raster = os.path.join(folder, f'Qpeak_{SCENARIOS[0]}_TR-{TRS[0]}.tif')
+        print("Sin TRs válidos. Calculando tc desde DEM...")
+        tc, L_m, S_mm = compute_tc_kirpich(dem_path, mask_raster)
+        tp_s  = 0.6 * tc
+        dur_s = 5.0 * tp_s
+        fixed_params = {sc: (tp_s, dur_s, n_default) for sc in SCENARIOS}
+        print(f"  tc={tc:.2f}h  tp={tp_s:.2f}h  dur={dur_s:.2f}h  n={n_default}")
+        pd.DataFrame([{
+            'L_km':       round(L_m / 1000.0, 4),
+            'slope_m_m':  round(float(S_mm), 6),
+            'tc_h':       round(tc, 4),
+            'tp_h':       round(tp_s, 4),
+        }]).to_excel(os.path.join(diag, '05_basin_geometry.xlsx'), index=False)
+
+    elif len(valid_trs) < min_valid_trs:
+        # Case 2: pocos TRs válidos — calibrar y promediar parámetros por escenario
+        fixed_params = {}
+        calib_rows = []
+        for sc in SCENARIOS:
+            tps, durs, ns = [], [], []
+            for tr in valid_trs:
+                df = all_data[sc][tr]
+                t = df[COL_TIME].values
+                q_obs = df[COL_Q].values
+                tp, qp, dur = stats[tr][sc]
+                n_opt, rmse = calibrate_n(t, q_obs, qp, tp)
+                tps.append(tp)
+                durs.append(dur)
+                ns.append(n_opt)
+                calib_rows.append({
+                    'TR': tr, 'scenario': sc,
+                    'Qp_m3s': round(qp, 4),
+                    'tp_h': round(tp, 4),
+                    'n_calibrated': round(n_opt, 6),
+                    'RMSE_m3s': round(rmse, 6),
+                })
+            fixed_params[sc] = (
+                float(np.mean(tps)),
+                float(np.mean(durs)),
+                float(np.mean(ns)),
+            )
+        pd.DataFrame(calib_rows).to_csv(
+            os.path.join(diag, '02_n_calibrated.csv'), index=False
+        )
+        print(
+            f"TRs válidos ({len(valid_trs)}) < min_valid_trs ({min_valid_trs}). "
+            "Usando parámetros fijos por escenario."
+        )
+
+    else:
+        # Normal: calibrar n + regresiones
+        calib_rows = []
+        reg_data = {sc: [] for sc in SCENARIOS}
+
+        for sc in SCENARIOS:
+            for tr in valid_trs:
+                df = all_data[sc][tr]
+                t = df[COL_TIME].values
+                q_obs = df[COL_Q].values
+                tp, qp, dur = stats[tr][sc]
+                n_opt, rmse = calibrate_n(t, q_obs, qp, tp)
+                reg_data[sc].append({'qp': qp, 'tp': tp, 'duration': dur, 'n': n_opt})
+                calib_rows.append({
+                    'TR': tr, 'scenario': sc,
+                    'Qp_m3s': round(qp, 4),
+                    'tp_h': round(tp, 4),
+                    'n_calibrated': round(n_opt, 6),
+                    'RMSE_m3s': round(rmse, 6),
+                })
+
+        pd.DataFrame(calib_rows).to_csv(
+            os.path.join(diag, '02_n_calibrated.csv'), index=False
+        )
+
+        reg_rows = []
+        regressions = {}
+        for sc in SCENARIOS:
+            qp_arr  = np.array([d['qp']       for d in reg_data[sc]])
+            tp_arr  = np.array([d['tp']        for d in reg_data[sc]])
+            dur_arr = np.array([d['duration']  for d in reg_data[sc]])
+            n_arr   = np.array([d['n']         for d in reg_data[sc]])
+            regressions[sc] = {
+                'f1_tp':       fit_regression(qp_arr, tp_arr),
+                'f2_duration': fit_regression(qp_arr, dur_arr),
+                'f3_n':        fit_regression(qp_arr, n_arr),
+            }
+            for fk, reg in regressions[sc].items():
+                reg_rows.append({
+                    'scenario': sc,
+                    'function': fk,
+                    'type': reg['type'],
+                    'params': str([round(p, 6) for p in reg['params']]),
+                    'r2': round(reg['r2'], 6),
+                })
+
+        pd.DataFrame(reg_rows).to_csv(
+            os.path.join(diag, '03_regressions.csv'), index=False
+        )
+        _plot_regressions(diag, regressions, reg_data)
+
+    # ------------------------------------------------------------------
+    # Reconstruir TRs inválidos
+    # ------------------------------------------------------------------
+    recon_rows = []
+    reconstructed: dict = {}
+
+    for tr in invalid_trs:
+        for sc in SCENARIOS:
+            qp_raster = get_qpeak_raster(folder, sc, tr)
+
+            if fixed_params is not None:
+                tp_est, dur_est, n_est = fixed_params[sc]
+                n_est = max(n_est, 1.001)
+            else:
+                tp_est  = float(regressions[sc]['f1_tp']['predict'](qp_raster))
+                dur_est = float(regressions[sc]['f2_duration']['predict'](qp_raster))
+                n_est   = max(float(regressions[sc]['f3_n']['predict'](qp_raster)), 1.001)
+
+            t     = np.linspace(0.0, dur_est, n_points)
+            q_new = scs_q(t, qp_raster, tp_est, n_est)
+
+            df_new = pd.DataFrame({COL_TIME: t, COL_Q: q_new})
+            df_new.to_csv(
+                os.path.join(folder, f'TS_Q_{sc}_TR-{tr}.csv'),
+                index=False,
+            )
+
+            reconstructed[(sc, tr)] = (t, q_new)
+            recon_rows.append({
+                'TR': tr, 'scenario': sc,
+                'Qp_raster_m3s':        round(qp_raster, 4),
+                'tp_estimated_h':       round(tp_est, 4),
+                'duration_estimated_h': round(dur_est, 4),
+                'n_estimated':          round(n_est, 6),
+            })
+
+    pd.DataFrame(recon_rows).to_csv(
+        os.path.join(diag, '04_reconstruction.csv'), index=False
+    )
+
+    _plot_hydrographs(diag, all_data, reconstructed, valid_trs, invalid_trs)
+
+    print(f"Diagnosticos  : {diag}")
+    print(f"Hidrogramas reconstruidos: {len(invalid_trs) * len(SCENARIOS)}")
+
+
 def BashFastFlood(JSONPath, SaveFullCSV=False):
 
     # ------------------------------------------------------------------------------------------------------------------
@@ -3143,6 +4396,15 @@ def BashFastFlood(JSONPath, SaveFullCSV=False):
 
     # Abrir el archivo log en modo escritura
     log = open(log_file, 'a')
+
+    # Configurar logger del módulo con el archivo de log
+    logger = get_module_logger(log_file=log_file)
+    logger.info("#" * 100)
+    logger.info("INICIANDO BashFastFlood")
+    logger.info(f"JSONPath: {JSONPath}")
+    logger.info(f"ProjectPath: {UserData['ProjectPath']}")
+    logger.info(f"NameBasinFolder: {UserData['NameBasinFolder']}")
+    log_memory(logger, "Memoria inicial BashFastFlood")
 
     # ------------------------------------------------------------------------------------------------------------------
     # Crear las carpetas para la ejecución de FastFlood
@@ -3376,33 +4638,28 @@ def BashFastFlood(JSONPath, SaveFullCSV=False):
                              Channel=Channel,
                              BoundaryCondition=BoundaryCondition,
                              log=log, IDF_Table=df_idf, StatusExe=True)
-    #
+
+    # ------------------------------------------------------------------------------------------------------------------
+    # Check - Reconstrucción de hidrogramas dañados por inestabilidad numérica
+    # ------------------------------------------------------------------------------------------------------------------
+    DischargePath  = ProjectPath + f'/out/06-FLOOD/Discharge'
+    correct_hydrographs(DischargePath, UserData["DEMPath"])
+
+    # ------------------------------------------------------------------------------------------------------------------
+    # Check - Se verifica que las profundidades del escenario BaU nunca sean menores que las del escenario Current,
+    #         Asi como también que las del escenario NbS nunca sean mayores que las del escenario BaU.
+    # Reglas aplicadas:
+    #     - Regla 3: Si Current > BaU > NbS → Current = BaU
+    #     - Regla 4: Si Current > NbS > BaU → BaU = Current
+    #     - Regla 5: Si NbS > Current > BaU → BaU = Current, NbS = Current
+    #     - Regla 6: Si NbS > BaU > Current → NbS = Current
+    # ------------------------------------------------------------------------------------------------------------------
     for TR_i in UserData["ClimateParams"]["ReturnPeriod"]:
         H_Path_H = ProjectPath + f'/out/06-FLOOD/Flood/Flood_Current_TR-{TR_i}.tif'
         H_Path_BaU = ProjectPath + f'/out/06-FLOOD/Flood/Flood_BaU_TR-{TR_i}.tif'
         H_Path_NbS = ProjectPath + f'/out/06-FLOOD/Flood/Flood_NbS_TR-{TR_i}.tif'
 
         CheckPixelDepth_V2(H_Path_H, H_Path_BaU, H_Path_NbS, H_Path_H, H_Path_BaU, H_Path_NbS)
-
-    # '''
-    # # ------------------------------------------------------------------------------------------------------------------
-    # # Check - Se verifica que las profundidades del escenario BaU nunca sean menores que las del escenario Current.
-    # # ------------------------------------------------------------------------------------------------------------------
-    # for TR_i in UserData['ClimateParams']['ReturnPeriod']:
-    #     H_Path_H   = ProjectPath + f'/out/06-FLOOD/Flood/Flood_Current_TR-{TR_i}.tif'
-    #     H_Path_BaU = ProjectPath + f'/out/06-FLOOD/Flood/Flood_BaU_TR-{TR_i}.tif'
-    #     # Check
-    #     CheckPixelDepth(H_Path_BaU, H_Path_H, H_Path_H)
-    #
-    # # ------------------------------------------------------------------------------------------------------------------
-    # # Check - Se verifica que las profundidades del escenario NbS nunca sean mayores que las del escenario BaU.
-    # # ------------------------------------------------------------------------------------------------------------------
-    # for TR_i in UserData['ClimateParams']['ReturnPeriod']:
-    #     H_Path_BaU = ProjectPath + f'/out/06-FLOOD/Flood/Flood_BaU_TR-{TR_i}.tif'
-    #     H_Path_NbS = ProjectPath + f'/out/06-FLOOD/Flood/Flood_NbS_TR-{TR_i}.tif'
-    #     # Check
-    #     CheckPixelDepth(H_Path_BaU, H_Path_NbS, H_Path_NbS)
-    # '''
 
     # ------------------------------------------------------------------------------------------------------------------
     # Step 7 - Leer curva de factors de daño y el costo máximo
@@ -3416,9 +4673,6 @@ def BashFastFlood(JSONPath, SaveFullCSV=False):
     LogMessage = f"Read Dagame Curve - Ok \n"
     log.write(LogMessage)
 
-    '''
-    Ojo! mirar el tema de la tasa de cambio para estar acorde con la moneda de análisis de WaterProof
-    '''
     # Se aplica la tasa de cambio en la cual se entregan los costos máximos de las funciones de daño
     DC = DC*UserData["DamagesExchangeRate"]
 
@@ -3471,46 +4725,73 @@ def BashFastFlood(JSONPath, SaveFullCSV=False):
         # ----------------------------------------------------------------------------------------------------------
         # Calculo de las profundidades por uso de suelo de daño
         # ----------------------------------------------------------------------------------------------------------
-        df_H = pd.concat([Raster2DataFrame_Damages(LULC_Damage['GHS_BUILT'], HPaths['H'][Sce], CodeLULC['GHS_BUILT'], UserData["CatchmentPath"]),
-                          Raster2DataFrame_Damages(LULC_Damage['InfraRoads'], HPaths['H'][Sce], CodeLULC['InfraRoads'],UserData["CatchmentPath"])],ignore_index=True)
+        logger.info(f"Procesando profundidades para escenario {Sce}")
+        log_memory(logger, f"INICIO pipeline chunked - Escenario {Sce}")
+
+        # Mapeo raster fuente → categorías que usan sus códigos
+        _raster_cats = {
+            'GHS_BUILT':  ['Residential', 'Commercial', 'Industrial', 'Agriculture'],
+            'InfraRoads': ['InfraRoads'],
+        }
+
+        # Acumuladores de EAD por categoría
+        ead_accum = {Cat: 0.0 for Cat in Cat_Damage}
+
+        # Limpiar CSVs previos si SaveFullCSV (se escribirán por chunk en modo append)
+        if SaveFullCSV:
+            for Cat in Cat_Damage:
+                for _p in [
+                    f'{UserData["ProjectPath"]}/{UserData["NameBasinFolder"]}/out/06-FLOOD/Flood/H_{Cat}_{Sce}.csv',
+                    f'{UserData["ProjectPath"]}/{UserData["NameBasinFolder"]}/out/06-FLOOD/Damages/01-Damage_{Cat}_{Sce}.csv',
+                    os.path.join(ProjectPath, 'out', '06-FLOOD', 'Damages', f'02-Expected_Annual_Damage_{Cat}_{Sce}.csv'),
+                ]:
+                    if os.path.exists(_p):
+                        os.remove(_p)
+
+        # Pipeline chunked: chunk → filtrar por Cat → TR_Damage → EAD → acumular escalar
+        for source_key, cats_source in _raster_cats.items():
+            logger.info(f"Fuente: {source_key} | Categorías: {cats_source}")
+            for chunk_df in Raster2DataFrame_Damages_Generator(
+                LULC_Damage[source_key],
+                HPaths['H'][Sce],
+                CodeLULC[source_key],
+                UserData["CatchmentPath"],
+                log_file=log_file
+            ):
+                for Cat in cats_source:
+                    df_cat = chunk_df[chunk_df['Code'].isin(CodeLULC[Cat])].copy()
+                    if df_cat.empty:
+                        continue
+
+                    if SaveFullCSV:
+                        _path_h = f'{UserData["ProjectPath"]}/{UserData["NameBasinFolder"]}/out/06-FLOOD/Flood/H_{Cat}_{Sce}.csv'
+                        df_cat.to_csv(_path_h, mode='a', header=not os.path.exists(_path_h), index=False)
+
+                    df_cat.drop('Code', axis=1, inplace=True)
+                    damage_chunk = TR_Damage(df_cat, DC, category=Cat) * FactorArea[Cat]
+
+                    if SaveFullCSV:
+                        _path_dmg = f'{UserData["ProjectPath"]}/{UserData["NameBasinFolder"]}/out/06-FLOOD/Damages/01-Damage_{Cat}_{Sce}.csv'
+                        damage_chunk.to_csv(_path_dmg, mode='a', header=not os.path.exists(_path_dmg), index=False)
+
+                    ead_chunk = EAD(TR=UserData['ClimateParams']['ReturnPeriod'], Damage=damage_chunk, NameCol=Cat)
+
+                    if SaveFullCSV:
+                        _path_ead = os.path.join(ProjectPath, 'out', '06-FLOOD', 'Damages', f'02-Expected_Annual_Damage_{Cat}_{Sce}.csv')
+                        ead_chunk.to_csv(_path_ead, mode='a', header=not os.path.exists(_path_ead))
+
+                    ead_accum[Cat] += ead_chunk.sum().sum()
+
+                del chunk_df
+
+        log_memory(logger, f"FIN pipeline chunked - Escenario {Sce}")
 
         for Cat in Cat_Damage:
-            # ----------------------------------------------------------------------------------------------------------
-            # Calculo de las profundidades por uso de suelo de daño
-            # ----------------------------------------------------------------------------------------------------------
-            # df = Raster2DataFrame_Damages(LULC_Damage[Cat], HPaths['H'][Sce], CodeLULC[Cat], UserData["CatchmentPath"])
-            # df.to_csv( f'{UserData["ProjectPath"]}/{UserData["NameBasinFolder"]}/out/06-FLOOD/Flood/H_{Cat}_{Sce}.csv', index=False)
-            # log.write(f"Read flood depth for the {Sce} scenario for {Cat} damages category- Ok \n")
-
-            df = df_H[df_H['Code'].isin(CodeLULC[Cat])]
-            if SaveFullCSV:
-                df.to_csv( f'{UserData["ProjectPath"]}/{UserData["NameBasinFolder"]}/out/06-FLOOD/Flood/H_{Cat}_{Sce}.csv', index=False)
+            Total_EAD.loc[Sce, Cat] = ead_accum[Cat]
             log.write(f"Read flood depth for the {Sce} scenario for {Cat} damages category- Ok \n")
-
-            # ----------------------------------------------------------------------------------------------------------
-            # Estimar costos
-            # ----------------------------------------------------------------------------------------------------------
-            if 'Code' in df.columns:
-                df.drop('Code', axis=1, inplace=True)
-
-            df = TR_Damage(df, DC, category=Cat)*FactorArea[Cat]
-            if SaveFullCSV:
-                df.to_csv(f'{UserData["ProjectPath"]}/{UserData["NameBasinFolder"]}/out/06-FLOOD/Damages/01-Damage_{Cat}_{Sce}.csv', index=False)
             log.write(f"Damage estimation for each return period of the {Sce} scenario {Cat} - Ok \n")
-
-            # ----------------------------------------------------------------------------------------------------------
-            # Step 9 - Estimar el daño anual esperado
-            # ----------------------------------------------------------------------------------------------------------
-            # Este factor corresponde a la división de área
-            OutEAD = EAD(TR=UserData['ClimateParams']['ReturnPeriod'], Damage=df, NameCol=Cat)
-            if SaveFullCSV:
-                OutEAD.to_csv(os.path.join(ProjectPath, 'out', '06-FLOOD', 'Damages', f'02-Expected_Annual_Damage_{Cat}_{Sce}.csv'))
             log.write(f"Estimated annual expected damages for the {Sce} scenario for {Cat} damages category- Ok- Ok \n")
-
-            # Agregar datos
-            Total_EAD.loc[Sce, Cat] = OutEAD.sum().sum()
             log.write(f"Estimated cumulative annual expected damages for the {Sce} scenario for {Cat} damages category- Ok- Ok \n")
-
             print(f"Estimated cumulative annual expected damages for the {Sce} scenario for {Cat} damages category -> Ok")
 
     # Guardar total
@@ -3568,5 +4849,3 @@ def BashFastFlood(JSONPath, SaveFullCSV=False):
     # Cerrar Log
     log.close()
     #"""
-
-
