@@ -3421,7 +3421,7 @@ def correct_hydrographs(
             'slope_m_m':  round(float(S_mm), 6),
             'tc_h':       round(tc, 4),
             'tp_h':       round(tp_s, 4),
-        }]).to_excel(os.path.join(diag, '05_basin_geometry.xlsx'), index=False)
+        }]).to_csv(os.path.join(diag, '05_basin_geometry.xlsx'), index=False)
 
     elif len(valid_trs) < min_valid_trs:
         # Case 2: pocos TRs válidos — calibrar y promediar parámetros por escenario
