@@ -1381,10 +1381,27 @@ def DesaggregationData(Data, NameCol, NBS, Time):
     t   = np.arange(0, Time + 1)
     Results_BaU = pd.DataFrame(data=np.empty([Time + 1, nn]), columns=NameCol)
     # Desagregación del escenario BaU
+    """
     for i in range(0, len(NameCol)):
         Wmax = Data[NameCol[i]][1]
         Wo   = Data[NameCol[i]][0]
         Results_BaU[NameCol[i]] = Sigmoid_Desaggregation(Wmax, Wo, r, t)
+    """
+
+    # Desagregación del escenario BaU
+    for col in NameCol:
+    
+        if col not in Data.columns:
+            raise KeyError(f"La columna '{col}' no existe en Data.")
+    
+        if len(Data[col]) < 2:
+            raise ValueError(
+                f"La columna '{col}' no tiene suficientes filas para extraer Wo y Wmax."
+            )
+           
+        Wmax = Data[col].iloc[1]    
+        Wo   = Data[col].iloc[0]
+        Results_BaU[col] = Sigmoid_Desaggregation(Wmax, Wo, r, t)
 
     # ------------------------------------------------------------------------------------------------------------------
     # NBS
