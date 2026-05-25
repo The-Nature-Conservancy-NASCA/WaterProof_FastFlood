@@ -1374,7 +1374,7 @@ def DesaggregationData(Data, NameCol, NBS, Time):
     # BaU
     # ------------------------------------------------------------------------------------------------------------------
     # Número de items a desagregar
-    nn  = np.shape(Data)[1]
+    nn  = len(NameCol)
     # Parámetro r de la función logística
     r   = -1 * np.log(0.000000001) / Time
     # Parámetro t de la función logística
@@ -1389,16 +1389,7 @@ def DesaggregationData(Data, NameCol, NBS, Time):
     """
 
     # Desagregación del escenario BaU
-    for col in NameCol:
-    
-        if col not in Data.columns:
-            raise KeyError(f"La columna '{col}' no existe en Data.")
-    
-        if len(Data[col]) < 2:
-            raise ValueError(
-                f"La columna '{col}' no tiene suficientes filas para extraer Wo y Wmax."
-            )
-           
+    for col in NameCol:           
         Wmax = Data[col].iloc[1]    
         Wo   = Data[col].iloc[0]
         Results_BaU[col] = Sigmoid_Desaggregation(Wmax, Wo, r, t)
@@ -1427,15 +1418,12 @@ def DesaggregationData(Data, NameCol, NBS, Time):
     # Desagregación del escenario NbS
     for i in range(0, len(NameCol)):
         Wmax    = Data[NameCol[i]].iloc[2]
-        Diff    = (Data[NameCol[i]][1] - Data[NameCol[i]].iloc[2]  )
-        Wo      = Results_BaU[NameCol[i]][1] - (p_NBS * Diff * 0.01)
+        Diff    = (Data[NameCol[i]].iloc[1] - Data[NameCol[i]].iloc[2])
+        Wo      = Results_BaU[NameCol[i]].iloc[1] - (p_NBS * Diff * 0.01)
 
         Results_NBS[NameCol[i]]     = Sigmoid_Desaggregation(Wmax, Wo, r, t)
         Results_NBS.loc[0, NameCol[i]] = Data[NameCol[i]].iloc[0]
         Results_NBS.loc[1, NameCol[i]] = Wo
-
-        #Results_NBS[NameCol[i]][0]  = Data[NameCol[i]][0]
-        #Results_NBS[NameCol[i]][1]  = Wo
 
         # Aplicación de factor
         Results_NBS[NameCol[i]]     = Results_BaU[NameCol[i]] - (Results_BaU[NameCol[i]] - Results_NBS[NameCol[i]])*Factor
