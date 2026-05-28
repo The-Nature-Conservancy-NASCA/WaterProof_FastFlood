@@ -4066,22 +4066,13 @@ def BashFastFlood(JSONPath, SaveFullCSV=False):
     # ------------------------------------------------------------------------------------------------------------------
     # Check - Reconstrucción de hidrogramas dañados por inestabilidad numérica
     # ------------------------------------------------------------------------------------------------------------------
-    D_DS = UserData["ClimateParams"]["DesignStormDuration_Historic"]
     DischargePath  = ProjectPath + f'/out/06-FLOOD/Discharge'
-    if UserData["ClimateParams"]["Scenario"] == "Historic":
-        correct_hydrographs(folder=DischargePath,
-                            dem_path=UserData["DEMPath"],
-                            idf_table=df_idf,
-                            d_ds=UserData["ClimateParams"]["DesignStormDuration_Historic"],
-                            D=UserData["ClimateParams"]["AnalysisStormDuration"],
-                            inf_raster=UserData["InfiltrationPath"])
-    else:
-        correct_hydrographs(folder=DischargePath,
-                            dem_path=UserData["DEMPath"],
-                            idf_table=df_idf,
-                            d_ds=UserData["ClimateParams"]["DesignStormDuration_ClimateChange"],
-                            D=UserData["ClimateParams"]["AnalysisStormDuration"],
-                            inf_raster=UserData["InfiltrationPath"])
+    correct_hydrographs(folder=DischargePath,
+                        dem_path=UserData["DEMPath"],
+                        idf_table=df_idf,
+                        d_ds=UserData["ClimateParams"]["DesignStormDuration_Historic"],
+                        D=UserData["ClimateParams"]["AnalysisStormDuration"],
+                        inf_raster=UserData["InfiltrationPath"])
 
     # ------------------------------------------------------------------------------------------------------------------
     # Check - Se verifica que las profundidades del escenario BaU nunca sean menores que las del escenario Current,
