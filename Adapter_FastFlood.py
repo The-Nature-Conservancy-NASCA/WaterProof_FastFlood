@@ -2939,7 +2939,6 @@ Parámetros:
 Retorna None. Reemplaza in-place los TR invalidos y escribe diagnosticos en '_diagnostics/'.
 # ------------------------------------------------------------------------------------------------------------------
 """
-
 import os
 import shutil
 import warnings
@@ -2959,40 +2958,53 @@ SCENARIOS = ['BaU', 'Current', 'NbS']
 TRS = [2, 5, 10, 20, 40, 50, 100, 200, 500, 1000]
 
 COL_TIME = 'time (hour)'
-COL_Q    = 'discharge (m3/s)'
-
+COL_Q = 'discharge (m3/s)'
 
 # ---------------------------------------------------------------------------
 # Fórmulas y estadísticas
 # ---------------------------------------------------------------------------
-
 def scs_q(t: np.ndarray, qp: float, tp: float, n: float) -> np.ndarray:
-    """
-    Hidrograma Unitario Sintético SCS normalizado (Williams & Hann 1973).
-    Garantiza q = qp exactamente en t = tp.
+    """Hidrograma Unitario Sintético SCS (Williams & Hann 1973).
 
-    t  : array de tiempo (h)
-    qp : caudal pico (m³/s)
-    tp : tiempo al pico (h)
-    n  : parámetro de forma (n > 1)
-    Returns array de caudal (m³/s).
+    Garantiza q == qp exactamente en t == tp.
+
+    Args:
+        t  (ndarray): tiempo (h).
+        qp (float)  : caudal pico (m³/s).
+        tp (float)  : tiempo al pico (h).
+        n  (float)  : parámetro de forma (n > 1).
+
+    Returns:
+        ndarray: caudal (m³/s).
     """
     r = np.clip(t / tp, 1e-12, None)
     return qp * (r ** (n - 1.0)) * np.exp((n - 1.0) * (1.0 - r))
 
 
 def r2_score(y: np.ndarray, y_hat: np.ndarray) -> float:
-    """Coeficiente de determinación R²."""
+    """Coeficiente de determinación R².
+
+    Args:
+        y     (ndarray): valores observados.
+        y_hat (ndarray): valores estimados.
+
+    Returns:
+        float: R² en [0, 1]; 0.0 si varianza total es cero.
+    """
     ss_tot = np.sum((y - y.mean()) ** 2)
     return 0.0 if ss_tot == 0 else float(1.0 - np.sum((y - y_hat) ** 2) / ss_tot)
 
 
 def hydrograph_stats(df: pd.DataFrame) -> tuple:
-    """
-    Extrae tp, Qp y duración de un hidrograma.
+    """Extrae tp, Qp y duración de un hidrograma.
 
-    df : DataFrame con columnas [time (hour), discharge (m3/s)]
-    Returns (tp_h, qp_m3s, duration_h).
+    Duración = último tiempo donde q > 1% * Qp.
+
+    Args:
+        df (DataFrame): columnas [time (hour), discharge (m3/s)].
+
+    Returns:
+        tuple: (tp_h, qp_m3s, duration_h).
     """
     t = df[COL_TIME].values
     q = df[COL_Q].values
@@ -3004,7 +3016,15 @@ def hydrograph_stats(df: pd.DataFrame) -> tuple:
 
 
 def has_plateau(q: np.ndarray, tol_rel: float = 1e-4) -> bool:
-    """True si el pico persiste más de 2 pasos de tiempo consecutivos."""
+    """Detecta plateau en el pico del hidrograma.
+
+    Args:
+        q       (ndarray): serie de caudal.
+        tol_rel (float)  : tolerancia relativa al pico (default 1e-4).
+
+    Returns:
+        bool: True si el pico persiste más de 2 pasos consecutivos.
+    """
     qp = q.max()
     at_peak = np.abs(q - qp) < tol_rel * qp
     streak = 0
@@ -3018,14 +3038,18 @@ def has_plateau(q: np.ndarray, tol_rel: float = 1e-4) -> bool:
 # ---------------------------------------------------------------------------
 # Validación
 # ---------------------------------------------------------------------------
-
 def validate_triplet(stats: dict, raw_q: dict) -> tuple:
-    """
-    Valida reglas de orden y unicidad para un TR.
+    """Valida reglas de orden y unicidad de tp/Qp para un TR.
 
-    stats : {escenario: (tp, qp, duration)}
-    raw_q : {escenario: array de caudal}
-    Returns (is_valid: bool, reason: str).
+    Reglas: tp_BaU < tp_Current, tp_BaU < tp_NbS, tp_NbS < tp_Current;
+    tres Qp distintos; ningún plateau en el pico.
+
+    Args:
+        stats (dict): {escenario: (tp, qp, duration)}.
+        raw_q (dict): {escenario: array de caudal}.
+
+    Returns:
+        tuple: (is_valid: bool, reason: str).
     """
     tp = {sc: stats[sc][0] for sc in SCENARIOS}
     qp = {sc: stats[sc][1] for sc in SCENARIOS}
@@ -3061,13 +3085,17 @@ def validate_triplet(stats: dict, raw_q: dict) -> tuple:
 # ---------------------------------------------------------------------------
 def calibrate_n(t: np.ndarray, q_obs: np.ndarray,
                 qp: float, tp: float, n0: float = 3.0) -> tuple:
-    """
-    Calibra n del HUS SCS vía Nelder-Mead minimizando SSE.
+    """Calibra el parámetro n del HUS SCS vía Nelder-Mead (minimiza SSE).
 
-    t, q_obs : serie temporal observada
-    qp, tp   : caudal y tiempo al pico fijos
-    n0       : valor inicial de n
-    Returns (n_optimo, RMSE).
+    Args:
+        t     (ndarray): tiempo observado (h).
+        q_obs (ndarray): caudal observado (m³/s).
+        qp    (float)  : caudal pico fijo (m³/s).
+        tp    (float)  : tiempo al pico fijo (h).
+        n0    (float)  : valor inicial de n (default 3.0).
+
+    Returns:
+        tuple: (n_optimo: float, RMSE: float).
     """
     def objective(params):
         n = params[0]
@@ -3087,13 +3115,15 @@ def calibrate_n(t: np.ndarray, q_obs: np.ndarray,
 # ---------------------------------------------------------------------------
 # Regresión
 # ---------------------------------------------------------------------------
-
 def fit_regression(x: np.ndarray, y: np.ndarray) -> dict:
-    """
-    Ajusta regresiones lineal, potencial y exponencial. Retorna la mejor por R².
+    """Ajusta regresiones lineal, potencial y exponencial; retorna la mejor por R².
 
-    x, y : arrays 1D de datos
-    Returns dict con: type, params, r2, predict (callable x -> y).
+    Args:
+        x (ndarray): variable independiente.
+        y (ndarray): variable dependiente.
+
+    Returns:
+        dict: {type, params, r2, predict} donde predict es callable x -> y.
     """
     x, y = np.asarray(x, float), np.asarray(y, float)
     best: dict = {'type': None, 'params': [], 'r2': -np.inf, 'predict': None}
@@ -3130,10 +3160,15 @@ def fit_regression(x: np.ndarray, y: np.ndarray) -> dict:
 # ---------------------------------------------------------------------------
 
 def get_qpeak_raster(folder: str, scenario: str, tr: int) -> float:
-    """
-    Lee el maximo pixel valido del raster de caudal pico.
+    """Lee el máximo píxel válido del raster de caudal pico.
 
-    Returns Qp (m3/s).
+    Args:
+        folder   (str): carpeta con los TIF.
+        scenario (str): nombre del escenario (BaU, Current, NbS).
+        tr       (int): periodo de retorno.
+
+    Returns:
+        float: Qp (m³/s).
     """
     path = os.path.join(folder, f"Qpeak_{scenario}_TR-{tr}.tif")
     with rasterio.open(path) as src:
@@ -3146,18 +3181,80 @@ def get_qpeak_raster(folder: str, scenario: str, tr: int) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Área de cuenca
+# ---------------------------------------------------------------------------
+def compute_basin_area_km2(mask_raster: str) -> float:
+    """Estima área de cuenca en km² desde raster máscara.
+
+    CRS proyectado: usa resolución directa.
+    CRS geográfico: reproyecta al UTM más cercano para obtener metros.
+
+    Args:
+        mask_raster (str): ruta al raster Qpeak que define la máscara.
+
+    Returns:
+        float: área en km².
+    """
+    with rasterio.open(mask_raster) as src:
+        data      = src.read(1).astype(float)
+        nd        = src.nodata
+        transform = src.transform
+        crs       = src.crs
+
+    valid = np.isfinite(data) & (data > 0)
+    if nd is not None:
+        valid &= data != np.float64(nd)
+    n_pixels = int(valid.sum())
+    if n_pixels == 0:
+        return 0.0
+
+    if crs.is_projected or getattr(crs, 'linear_units', '') in ('metre', 'meter', 'm'):
+        res_x = abs(float(transform.a))
+        res_y = abs(float(transform.e))
+        return n_pixels * res_x * res_y / 1e6
+
+    # CRS no proyectado: WGS84 → zona UTM → resolución en metros.
+    # Fallback: pixel nativo como metros si pyproj no reconoce el CRS.
+    rows, cols = np.where(valid)
+    row_c = float(rows.mean())
+    col_c = float(cols.mean())
+    x_c, y_c = rasterio.transform.xy(transform, row_c, col_c)
+
+    try:
+        from pyproj import Transformer as _Tr, CRS as _CRS
+        pcrs     = _CRS.from_wkt(crs.to_wkt())
+        lon_c, lat_c = _Tr.from_crs(pcrs, 4326, always_xy=True).transform(x_c, y_c)
+        utm_zone = int((lon_c + 180) / 6) + 1
+        utm_epsg = (32600 if lat_c >= 0 else 32700) + utm_zone
+        tr       = _Tr.from_crs(pcrs, utm_epsg, always_xy=True)
+        cx, _    = tr.transform(x_c, y_c)
+        ex, _    = tr.transform(x_c + abs(float(transform.a)), y_c)
+        _, cy    = tr.transform(x_c, y_c)
+        _, ey    = tr.transform(x_c, y_c + abs(float(transform.e)))
+        res_x_m  = abs(ex - cx)
+        res_y_m  = abs(ey - cy)
+    except Exception:
+        res_x_m = abs(float(transform.a))
+        res_y_m = abs(float(transform.e))
+    return n_pixels * res_x_m * res_y_m / 1e6
+
+
+# ---------------------------------------------------------------------------
 # Tiempo de concentración (D8 disk-based + Kirpich) — mínima huella de RAM
 # ---------------------------------------------------------------------------
-
 def compute_tc_kirpich(dem_path: str, mask_raster: str) -> tuple:
-    """
-    Estima tiempo de concentracion (h) por Kirpich.
-    L = distancia maxima entre pixeles del borde de la mascara de cuenca.
-    S = (Hmax - Hmin) / L
+    """Estima tiempo de concentración (h) por fórmula de Kirpich.
 
-    dem_path    : DEM (puede ser mas grande que mask_raster)
-    mask_raster : raster Qpeak — define extension y mascara de cuenca
-    Returns (tc, L_m, S).
+    L = distancia máxima entre píxeles del borde de la máscara (ConvexHull).
+    S = (Hmax - Hmin) / L.
+    tc = 0.000325 * L^0.77 * S^(-0.385).
+
+    Args:
+        dem_path    (str): ruta al DEM (puede exceder el extent de mask_raster).
+        mask_raster (str): ruta al raster Qpeak — define extensión y máscara.
+
+    Returns:
+        tuple: (tc_h: float, L_m: float, S: float).
     """
     from scipy.ndimage import binary_erosion
     from scipy.spatial import ConvexHull
@@ -3244,11 +3341,88 @@ def compute_tc_kirpich(dem_path: str, mask_raster: str) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# Infiltración promedio de cuenca
+# ---------------------------------------------------------------------------
+def compute_mean_infiltration(inf_raster: str, mask_raster: str,
+                              threshold: float = None) -> float:
+    """Calcula la infiltración promedio sobre la cuenca.
+
+    Args:
+        inf_raster  (str)  : raster de infiltración (mm/h).
+        mask_raster (str)  : ruta al raster Qpeak — define extensión y máscara.
+        threshold   (float): si se provee, solo promedian píxeles con inf < threshold.
+
+    Returns:
+        float: media aritmética de píxeles válidos dentro de la máscara.
+    """
+    with rasterio.open(mask_raster) as msk:
+        bounds   = msk.bounds
+        msk_data = msk.read(1).astype(np.float32)
+        nd_mask  = msk.nodata
+        msk_tf   = msk.transform
+        msk_crs  = msk.crs
+
+    with rasterio.open(inf_raster) as src:
+        win    = _window_from_bounds(
+            bounds.left, bounds.bottom, bounds.right, bounds.top,
+            transform=src.transform,
+        )
+        data   = src.read(1, window=win).astype(np.float32)
+        inf_tf = src.window_transform(win)
+        inf_nd = src.nodata
+        inf_crs = src.crs
+
+    rows, cols = data.shape
+
+    valid_src = np.ones_like(msk_data, dtype=np.int32)
+    if nd_mask is not None:
+        valid_src[msk_data == nd_mask] = 0
+    valid_src[~np.isfinite(msk_data) | (msk_data <= 0)] = 0
+    del msk_data
+
+    ws = np.zeros((rows, cols), dtype=np.int32)
+    reproject(
+        source=valid_src, destination=ws,
+        src_transform=msk_tf, src_crs=msk_crs,
+        dst_transform=inf_tf, dst_crs=inf_crs,
+        resampling=Resampling.nearest,
+    )
+    mask = ws.astype(bool)
+    del ws, valid_src
+
+    if inf_nd is not None:
+        data[data == np.float32(inf_nd)] = np.nan
+    data[~mask] = np.nan
+    del mask
+    if threshold is not None:
+        data[data >= np.float32(threshold)] = np.nan
+
+    result = float(np.nanmean(data[np.isfinite(data)]))
+    del data
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Plots
 # ---------------------------------------------------------------------------
 
 def _plot_hydrographs(diag: str, all_data: dict, reconstructed: dict,
                       valid_trs: list, invalid_trs: list) -> None:
+    """Genera y guarda gráficas de hidrogramas por escenario.
+
+    Muestra: originales válidos (sólido), dañados (gris punteado),
+    reconstruidos (línea discontinua). Salida en diag/plots/.
+
+    Args:
+        diag         (str) : carpeta _diagnostics.
+        all_data     (dict): {escenario: {tr: DataFrame}}.
+        reconstructed(dict): {(escenario, tr): (t_array, q_array)}.
+        valid_trs    (list): TRs válidos.
+        invalid_trs  (list): TRs inválidos.
+
+    Returns:
+        None.
+    """
     plots_dir = os.path.join(diag, 'plots')
     os.makedirs(plots_dir, exist_ok=True)
 
@@ -3284,6 +3458,16 @@ def _plot_hydrographs(diag: str, all_data: dict, reconstructed: dict,
 
 
 def _plot_regressions(diag: str, regressions: dict, reg_data: dict) -> None:
+    """Genera y guarda gráfica 3×3 de regresiones (f1/f2/f3 × escenario).
+
+    Args:
+        diag        (str) : carpeta _diagnostics.
+        regressions (dict): {escenario: {función: reg_dict}}.
+        reg_data    (dict): {escenario: [{'qp', 'tp', 'duration', 'n'}, ...]}.
+
+    Returns:
+        None.
+    """
     plots_dir = os.path.join(diag, 'plots')
     os.makedirs(plots_dir, exist_ok=True)
 
@@ -3316,27 +3500,48 @@ def _plot_regressions(diag: str, regressions: dict, reg_data: dict) -> None:
     plt.close(fig)
 
 
+# ---------------------------------------------------------------------------
+# Función principal
+# ---------------------------------------------------------------------------
 def correct_hydrographs(
     folder: str,
     dem_path: str,
     min_valid_trs: int = 2,
     n_default: float = 13.5,
+    idf_table: pd.DataFrame = None,
+    d_ds: float = 0.0,
+    D: float = None,
+    inf_raster: str = None,
 ) -> None:
-    """
-    Detecta y reconstruye hidrogramas SCS dañados por errores numéricos.
+    """Detecta y reconstruye hidrogramas SCS dañados por errores numéricos.
 
-    folder       : ruta con TS_Q_*.csv y Qpeak_*.tif
-    dem_path     : ruta al DEM de la cuenca (se procesa solo si no hay TRs válidos)
-    min_valid_trs: TRs válidos mínimos para usar regresión (default 2)
-    n_default    : parámetro n fijo cuando no hay TRs válidos (default 13.5)
-    Escribe:
-        TS_Q_{SC}_TR-{TR}.csv  (reemplaza originals de TR invalidos)
-        _diagnostics/_originals_backup/
-        _diagnostics/01_validation.csv
-        _diagnostics/02_n_calibrated.csv   (casos 2 y normal)
-        _diagnostics/03_regressions.csv    (solo caso normal)
-        _diagnostics/04_reconstruction.csv
-        _diagnostics/plots/
+    Casos de borde:
+        Case 0 — todos válidos         : retorna sin cambios.
+        Case 2 — válidos < min_valid_trs: parámetros fijos por escenario.
+        Case 3 — ningún TR válido      : parámetros sintéticos vía Kirpich + SCS.
+        Normal — válidos ≥ min_valid_trs: regresión completa f1/f2/f3.
+
+    Args:
+        folder        (str)      : ruta con TS_Q_*.csv y Qpeak_*.tif.
+        dem_path      (str)      : ruta al DEM (requerido en Case 3).
+        min_valid_trs (int)      : mínimo TRs válidos para regresión (default 2).
+        n_default     (float)    : n fijo cuando no hay TRs válidos (default 13.5).
+        idf_table     (DataFrame): filas=duración, columnas=TR — requerido en Case 3.
+        d_ds          (float)    : duración para lookup en idf_table (h).
+        D             (float)    : duración de tormenta para Pe (h); None → usa d_ds.
+        inf_raster    (str)      : raster de infiltración promedio (mm/h); opcional.
+
+    Returns:
+        None. Escribe:
+            TS_Q_{SC}_TR-{TR}.csv           (TRs inválidos reemplazados in-place)
+            _diagnostics/_originals_backup/
+            _diagnostics/01_validation.csv
+            _diagnostics/02_n_calibrated.csv  (casos 2 y normal)
+            _diagnostics/03_regressions.csv   (solo caso normal)
+            _diagnostics/04_reconstruction.csv
+            _diagnostics/05_basin_geometry.csv (solo Case 3)
+            _diagnostics/06_pe_by_tr.csv       (solo Case 3)
+            _diagnostics/plots/
     """
     diag = os.path.join(folder, '_diagnostics')
     os.makedirs(diag, exist_ok=True)
@@ -3408,25 +3613,52 @@ def correct_hydrographs(
     # ------------------------------------------------------------------
     # Determinar modo de reconstrucción
     # ------------------------------------------------------------------
-    fixed_params = None   # {sc: (tp, dur, n)} — None = usar regresiones
-    regressions = None
-    reg_data = None
+    fixed_params  = None   # {sc: (tp, dur, n)} — None = usar regresiones
+    case3_params  = None   # {A_km2, pe, dur} — solo Case 3
+    regressions   = None
+    reg_data      = None
 
     if not valid_trs:
-        # Case 3: ningún TR válido — parámetros sintéticos desde DEM
+        # Case 3: ningún TR válido — tp via SCS (0.208*A*Pe/Qp), dur via Kirpich
+        if idf_table is None:
+            raise ValueError(
+                "Case 3: ningún TR válido — se requiere idf_table (filas=duración h, columnas=TR)."
+            )
         mask_raster = os.path.join(folder, f'Qpeak_{SCENARIOS[0]}_TR-{TRS[0]}.tif')
-        print("Sin TRs válidos. Calculando tc desde DEM...")
+        print("Sin TRs válidos. Calculando tc (Kirpich) y área de cuenca...")
         tc, L_m, S_mm = compute_tc_kirpich(dem_path, mask_raster)
-        tp_s  = 0.6 * tc
-        dur_s = 5.0 * tp_s
-        fixed_params = {sc: (tp_s, dur_s, n_default) for sc in SCENARIOS}
-        print(f"  tc={tc:.2f}h  tp={tp_s:.2f}h  dur={dur_s:.2f}h  n={n_default}")
-        pd.DataFrame([{
+        A_km2        = compute_basin_area_km2(mask_raster)
+        dur_kirpich  = 5.0 * 0.6 * tc
+        _D           = D if D is not None else d_ds
+        inf_avg_by_tr = {}
+        pe_by_tr      = {}
+        for tr in TRS:
+            I_tr         = float(idf_table.loc[d_ds, tr])
+            Inf_avg_tr   = (compute_mean_infiltration(inf_raster, mask_raster, threshold=I_tr)
+                            if inf_raster else 0.0)
+            inf_avg_by_tr[tr] = Inf_avg_tr
+            pe = (I_tr - Inf_avg_tr) * _D
+            pe_by_tr[tr] = pe if pe > 0 else 1.0
+        case3_params = {'A_km2': A_km2, 'pe_by_tr': pe_by_tr, 'dur': dur_kirpich}
+        print(f"  tc={tc:.2f}h  dur={dur_kirpich:.2f}h  A={A_km2:.2f}km²"
+              f"  d_ds={d_ds}h  D={_D}h")
+        geo_rows = [{
             'L_km':       round(L_m / 1000.0, 4),
             'slope_m_m':  round(float(S_mm), 6),
             'tc_h':       round(tc, 4),
-            'tp_h':       round(tp_s, 4),
-        }]).to_csv(os.path.join(diag, '05_basin_geometry.csv'), index=False)
+            'dur_h':      round(dur_kirpich, 4),
+            'A_km2':      round(A_km2, 4),
+            'd_ds_h':     d_ds,
+            'D_h':        _D,
+        }]
+        idf_rows = [
+            {'TR': tr, 'I_mm_h': round(float(idf_table.loc[d_ds, tr]), 4),
+             'inf_avg_mm': round(inf_avg_by_tr[tr], 4),
+             'pe_mm': round(pe_by_tr[tr], 4)}
+            for tr in TRS
+        ]
+        pd.DataFrame(geo_rows).to_csv(os.path.join(diag, '05_basin_geometry.csv'), index=False)
+        pd.DataFrame(idf_rows).to_csv(os.path.join(diag, '06_pe_by_tr.csv'), index=False)
 
     elif len(valid_trs) < min_valid_trs:
         # Case 2: pocos TRs válidos — calibrar y promediar parámetros por escenario
@@ -3524,7 +3756,13 @@ def correct_hydrographs(
         for sc in SCENARIOS:
             qp_raster = get_qpeak_raster(folder, sc, tr)
 
-            if fixed_params is not None:
+            if case3_params is not None:
+                pe_tr   = case3_params['pe_by_tr'][tr]
+                tp_est  = (0.208 * case3_params['A_km2'] * pe_tr) / qp_raster
+                # En el supuesto de un hidrograma unitario triangular (según el método del SCS/NRCS)
+                dur_est = 2.67*tp_est #case3_params['dur']
+                n_est   = max(n_default, 1.001)
+            elif fixed_params is not None:
                 tp_est, dur_est, n_est = fixed_params[sc]
                 n_est = max(n_est, 1.001)
             else:
@@ -3828,8 +4066,22 @@ def BashFastFlood(JSONPath, SaveFullCSV=False):
     # ------------------------------------------------------------------------------------------------------------------
     # Check - Reconstrucción de hidrogramas dañados por inestabilidad numérica
     # ------------------------------------------------------------------------------------------------------------------
+    D_DS = UserData["ClimateParams"]["DesignStormDuration_Historic"]
     DischargePath  = ProjectPath + f'/out/06-FLOOD/Discharge'
-    correct_hydrographs(DischargePath, UserData["DEMPath"])
+    if UserData["ClimateParams"]["Scenario"] == "Historic":
+        correct_hydrographs(folder=DischargePath,
+                            dem_path=UserData["DEMPath"],
+                            idf_table=df_idf,
+                            d_ds=UserData["ClimateParams"]["DesignStormDuration_Historic"],
+                            D=UserData["ClimateParams"]["AnalysisStormDuration"],
+                            inf_raster=UserData["InfiltrationPath"])
+    else:
+        correct_hydrographs(folder=DischargePath,
+                            dem_path=UserData["DEMPath"],
+                            idf_table=df_idf,
+                            d_ds=UserData["ClimateParams"]["DesignStormDuration_ClimateChange"],
+                            D=UserData["ClimateParams"]["AnalysisStormDuration"],
+                            inf_raster=UserData["InfiltrationPath"])
 
     # ------------------------------------------------------------------------------------------------------------------
     # Check - Se verifica que las profundidades del escenario BaU nunca sean menores que las del escenario Current,
