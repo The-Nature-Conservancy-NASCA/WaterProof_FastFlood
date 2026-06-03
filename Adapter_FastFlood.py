@@ -374,7 +374,11 @@ def calcular_estadisticas_idf_cuenca(carpeta_rasters, shapefile_cuenca, estadist
     periodos_existentes = [p for p in periodos_ordenados if p in df_idf.columns]
 
     df_idf = df_idf.loc[duraciones_existentes, periodos_existentes]
-
+    
+    # Del raster original se tienen las precipitaciones totales por cada duración por TR. 
+    # Para generar la intensidades dividimos por la duración
+    df_idf = df_idf / np.array([[3], [6], [12], [24], [48], [72], [120], [240]])
+    
     print(f"\nCompletado! Tabla IDF con estadística '{estadistica}'")
     print(f"Duraciones: {duraciones_existentes}")
     print(f"Períodos de retorno: {periodos_existentes}")
@@ -2948,6 +2952,7 @@ import rasterio
 from rasterio.warp import reproject, Resampling
 from rasterio.windows import from_bounds as _window_from_bounds
 import matplotlib
+
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
@@ -2959,6 +2964,7 @@ TRS = [2, 5, 10, 20, 40, 50, 100, 200, 500, 1000]
 
 COL_TIME = 'time (hour)'
 COL_Q = 'discharge (m3/s)'
+
 
 # ---------------------------------------------------------------------------
 # Fórmulas y estadísticas
@@ -3097,6 +3103,7 @@ def calibrate_n(t: np.ndarray, q_obs: np.ndarray,
     Returns:
         tuple: (n_optimo: float, RMSE: float).
     """
+
     def objective(params):
         n = params[0]
         if n <= 1.001:
@@ -3177,6 +3184,8 @@ def get_qpeak_raster(folder: str, scenario: str, tr: int) -> float:
         if nd is not None:
             data = data[data != nd]
         data = data[np.isfinite(data) & (data > 0)]
+        if data.size == 0:
+            return 0.0
         return float(data.max())
 
 
@@ -3186,35 +3195,30 @@ def get_qpeak_raster(folder: str, scenario: str, tr: int) -> float:
 def compute_basin_area_km2(mask_raster: str) -> float:
     """Estima área de cuenca en km² desde raster máscara.
 
-    CRS proyectado: usa resolución directa.
-    CRS geográfico: reproyecta al UTM más cercano para obtener metros.
+    Todos los píxeles no-NoData se cuentan como cuenca.
+    Siempre reproyecta al UTM más cercano para evitar distorsión de EPSG:3857
+    y otras proyecciones no equal-area.
 
     Args:
-        mask_raster (str): ruta al raster Qpeak que define la máscara.
+        mask_raster (str): ruta al raster recortado exactamente a la cuenca.
 
     Returns:
         float: área en km².
     """
     with rasterio.open(mask_raster) as src:
-        data      = src.read(1).astype(float)
-        nd        = src.nodata
+        data = src.read(1).astype(float)
+        nd = src.nodata
         transform = src.transform
-        crs       = src.crs
+        crs = src.crs
 
-    valid = np.isfinite(data) & (data > 0)
+    valid = np.isfinite(data)
     if nd is not None:
         valid &= data != np.float64(nd)
     n_pixels = int(valid.sum())
     if n_pixels == 0:
         return 0.0
 
-    if crs.is_projected or getattr(crs, 'linear_units', '') in ('metre', 'meter', 'm'):
-        res_x = abs(float(transform.a))
-        res_y = abs(float(transform.e))
-        return n_pixels * res_x * res_y / 1e6
-
-    # CRS no proyectado: WGS84 → zona UTM → resolución en metros.
-    # Fallback: pixel nativo como metros si pyproj no reconoce el CRS.
+    # Siempre reproyectar a UTM — evita error de área en EPSG:3857 y similares.
     rows, cols = np.where(valid)
     row_c = float(rows.mean())
     col_c = float(cols.mean())
@@ -3222,20 +3226,33 @@ def compute_basin_area_km2(mask_raster: str) -> float:
 
     try:
         from pyproj import Transformer as _Tr, CRS as _CRS
-        pcrs     = _CRS.from_wkt(crs.to_wkt())
+        pcrs = _CRS.from_wkt(crs.to_wkt())
         lon_c, lat_c = _Tr.from_crs(pcrs, 4326, always_xy=True).transform(x_c, y_c)
         utm_zone = int((lon_c + 180) / 6) + 1
         utm_epsg = (32600 if lat_c >= 0 else 32700) + utm_zone
-        tr       = _Tr.from_crs(pcrs, utm_epsg, always_xy=True)
-        cx, _    = tr.transform(x_c, y_c)
-        ex, _    = tr.transform(x_c + abs(float(transform.a)), y_c)
-        _, cy    = tr.transform(x_c, y_c)
-        _, ey    = tr.transform(x_c, y_c + abs(float(transform.e)))
-        res_x_m  = abs(ex - cx)
-        res_y_m  = abs(ey - cy)
+        tr = _Tr.from_crs(pcrs, utm_epsg, always_xy=True)
+        cx, _ = tr.transform(x_c, y_c)
+        ex, _ = tr.transform(x_c + abs(float(transform.a)), y_c)
+        _, cy = tr.transform(x_c, y_c)
+        _, ey = tr.transform(x_c, y_c + abs(float(transform.e)))
+        res_x_m = abs(ex - cx)
+        res_y_m = abs(ey - cy)
     except Exception:
-        res_x_m = abs(float(transform.a))
-        res_y_m = abs(float(transform.e))
+        # pyproj no disponible o PROJ DB mismatch: detectar Web Mercator desde WKT
+        import math as _math
+        try:
+            _wkt = crs.to_wkt()
+        except Exception:
+            _wkt = ''
+        _is_web_mercator = any(k in _wkt for k in ('3857', '900913', 'Pseudo_Mercator', 'Pseudo-Mercator'))
+        if _is_web_mercator:
+            _lat = 2 * _math.atan(_math.exp(y_c / 6_378_137.0)) - _math.pi / 2
+            _cos = _math.cos(_lat)
+            res_x_m = abs(float(transform.a)) * _cos
+            res_y_m = abs(float(transform.e)) * _cos
+        else:
+            res_x_m = abs(float(transform.a))
+            res_y_m = abs(float(transform.e))
     return n_pixels * res_x_m * res_y_m / 1e6
 
 
@@ -3261,23 +3278,23 @@ def compute_tc_kirpich(dem_path: str, mask_raster: str) -> tuple:
 
     # --- Qpeak: bounds y mascara ---
     with rasterio.open(mask_raster) as msk:
-        bounds   = msk.bounds
+        bounds = msk.bounds
         msk_data = msk.read(1).astype(np.float32)
-        nd_mask  = msk.nodata
-        msk_tf   = msk.transform
-        msk_crs  = msk.crs
+        nd_mask = msk.nodata
+        msk_tf = msk.transform
+        msk_crs = msk.crs
 
     # --- DEM clip ventana sobre extent del Qpeak ---
     with rasterio.open(dem_path) as dem_src:
-        win     = _window_from_bounds(
+        win = _window_from_bounds(
             bounds.left, bounds.bottom, bounds.right, bounds.top,
             transform=dem_src.transform,
         )
         dem_raw = dem_src.read(1, window=win).astype(np.float32)
-        dem_tf  = dem_src.window_transform(win)
-        dem_nd  = dem_src.nodata
+        dem_tf = dem_src.window_transform(win)
+        dem_nd = dem_src.nodata
         dem_crs = dem_src.crs
-        res     = float(abs(float(dem_tf.a)))
+        res = float(abs(float(dem_tf.a)))
 
     rows, cols = dem_raw.shape
 
@@ -3324,18 +3341,18 @@ def compute_tc_kirpich(dem_path: str, mask_raster: str) -> tuple:
     # Convex hull reduce a O(sqrt(n)) vertices; diametro siempre en hull
     if len(pts) >= 3:
         hull = ConvexHull(pts)
-        pts  = pts[hull.vertices]
+        pts = pts[hull.vertices]
 
     # Par mas distante entre vertices del hull
     max_d2 = 0.0
     for i in range(len(pts)):
         for j in range(i + 1, len(pts)):
-            d2 = (pts[i, 0] - pts[j, 0])**2 + (pts[i, 1] - pts[j, 1])**2
+            d2 = (pts[i, 0] - pts[j, 0]) ** 2 + (pts[i, 1] - pts[j, 1]) ** 2
             if d2 > max_d2:
                 max_d2 = d2
     L = max(float(np.sqrt(max_d2)), res)
 
-    S  = max((H_max - H_min) / L, 0.001)
+    S = max((H_max - H_min) / L, 0.001)
     tc = 0.000325 * (L ** 0.77) * (S ** (-0.385))
     return tc, L, S
 
@@ -3344,30 +3361,33 @@ def compute_tc_kirpich(dem_path: str, mask_raster: str) -> tuple:
 # Infiltración promedio de cuenca
 # ---------------------------------------------------------------------------
 def compute_mean_infiltration(inf_raster: str, mask_raster: str,
-                              threshold: float = None) -> float:
+                              threshold: float = None,
+                              factor: float = 1.0) -> float:
     """Calcula la infiltración promedio sobre la cuenca.
 
     Args:
         inf_raster  (str)  : raster de infiltración (mm/h).
         mask_raster (str)  : ruta al raster Qpeak — define extensión y máscara.
         threshold   (float): si se provee, solo promedian píxeles con inf < threshold.
+        factor      (float): factor de corrección multiplicativo sobre los valores de
+                             infiltración antes del promedio (default 1.0 = sin cambio).
 
     Returns:
         float: media aritmética de píxeles válidos dentro de la máscara.
     """
     with rasterio.open(mask_raster) as msk:
-        bounds   = msk.bounds
+        bounds = msk.bounds
         msk_data = msk.read(1).astype(np.float32)
-        nd_mask  = msk.nodata
-        msk_tf   = msk.transform
-        msk_crs  = msk.crs
+        nd_mask = msk.nodata
+        msk_tf = msk.transform
+        msk_crs = msk.crs
 
     with rasterio.open(inf_raster) as src:
-        win    = _window_from_bounds(
+        win = _window_from_bounds(
             bounds.left, bounds.bottom, bounds.right, bounds.top,
             transform=src.transform,
         )
-        data   = src.read(1, window=win).astype(np.float32)
+        data = src.read(1, window=win).astype(np.float32)
         inf_tf = src.window_transform(win)
         inf_nd = src.nodata
         inf_crs = src.crs
@@ -3394,6 +3414,8 @@ def compute_mean_infiltration(inf_raster: str, mask_raster: str,
         data[data == np.float32(inf_nd)] = np.nan
     data[~mask] = np.nan
     del mask
+    if factor != 1.0:
+        data *= np.float32(factor)
     if threshold is not None:
         data[data >= np.float32(threshold)] = np.nan
 
@@ -3478,9 +3500,9 @@ def _plot_regressions(diag: str, regressions: dict, reg_data: dict) -> None:
     for j, sc in enumerate(SCENARIOS):
         qp_pts = np.array([d['qp'] for d in reg_data[sc]])
         y_pts = {
-            'f1_tp':       np.array([d['tp']       for d in reg_data[sc]]),
-            'f2_duration': np.array([d['duration']  for d in reg_data[sc]]),
-            'f3_n':        np.array([d['n']         for d in reg_data[sc]]),
+            'f1_tp': np.array([d['tp'] for d in reg_data[sc]]),
+            'f2_duration': np.array([d['duration'] for d in reg_data[sc]]),
+            'f3_n': np.array([d['n'] for d in reg_data[sc]]),
         }
         for i, (fk, yl) in enumerate(zip(fn_keys, ylabels)):
             ax = axes[i][j]
@@ -3501,35 +3523,96 @@ def _plot_regressions(diag: str, regressions: dict, reg_data: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Display status
+# ---------------------------------------------------------------------------
+def _write_display_status(diag: str, folder: str, case3_params) -> None:
+    """Genera 07_display_status.csv con flags de visibilidad por TR para el sistema web.
+
+    Args:
+        diag         (str) : carpeta _diagnostics.
+        folder       (str) : carpeta con los rasters Qpeak.
+        case3_params (dict): parámetros Case 3 con pe_by_tr; None si no aplica.
+    """
+    rows = []
+    for tr in TRS:
+        qp_sc = {sc: get_qpeak_raster(folder, sc, tr) for sc in SCENARIOS}
+        qp_ok = all(qp >= 0.01 for qp in qp_sc.values())
+        pe_neta_ok = (case3_params['pe_by_tr'][tr] > 0.0) if case3_params is not None else True
+        rows.append({
+            'TR': tr,
+            'qp_ok': qp_ok,
+            'pe_neta_ok': pe_neta_ok,
+            'mostrar': qp_ok and pe_neta_ok,
+        })
+    pd.DataFrame(rows).to_csv(
+        os.path.join(diag, '07_display_status.csv'), index=False
+    )
+
+
+# ---------------------------------------------------------------------------
+# Selección de bloque de regresión
+# ---------------------------------------------------------------------------
+def _select_regression_trs(valid_trs: list, all_trs: list) -> list:
+    """Selecciona el bloque consecutivo de mayor TR (>=2 elementos) para regresión.
+
+    Args:
+        valid_trs (list): TRs que pasaron validación individual.
+        all_trs   (list): Secuencia completa de TRs ordenados ascendente.
+
+    Returns:
+        list: Bloque con mayor TR que tenga >=2 elementos consecutivos; [] si ninguno.
+    """
+    if not valid_trs:
+        return []
+    valid_set = set(valid_trs)
+    blocks, current = [], []
+    for tr in all_trs:
+        if tr in valid_set:
+            current.append(tr)
+        else:
+            if current:
+                blocks.append(current)
+            current = []
+    if current:
+        blocks.append(current)
+    valid_blocks = [b for b in blocks if len(b) >= 2]
+    return valid_blocks[-1] if valid_blocks else []
+
+
+# ---------------------------------------------------------------------------
 # Función principal
 # ---------------------------------------------------------------------------
 def correct_hydrographs(
-    folder: str,
-    dem_path: str,
-    min_valid_trs: int = 2,
-    n_default: float = 13.5,
-    idf_table: pd.DataFrame = None,
-    d_ds: float = 0.0,
-    D: float = None,
-    inf_raster: str = None,
+        folder: str,
+        dem_path: str,
+        n_default: float = 13.5,
+        idf_table: pd.DataFrame = None,
+        d_ds: float = 0.0,
+        D: float = None,
+        inf_raster: str = None,
+        inf_correction: float = 1.0,
 ) -> None:
     """Detecta y reconstruye hidrogramas SCS dañados por errores numéricos.
 
     Casos de borde:
-        Case 0 — todos válidos         : retorna sin cambios.
-        Case 2 — válidos < min_valid_trs: parámetros fijos por escenario.
-        Case 3 — ningún TR válido      : parámetros sintéticos vía Kirpich + SCS.
-        Normal — válidos ≥ min_valid_trs: regresión completa f1/f2/f3.
+        Case 0 — todos válidos              : retorna sin cambios.
+        Case 3 — sin bloque consecutivo ≥ 2 : parámetros sintéticos vía Kirpich + SCS.
+        Normal — bloque consecutivo ≥ 2     : regresión completa f1/f2/f3.
+
+        El bloque de regresión es el mayor grupo de TRs válidos *consecutivos* (adyacentes
+        en [2,5,10,20,40,50,100,200,500,1000]) con al menos 2 elementos. Si hay varios
+        grupos consecutivos se usa el de mayor período de retorno.
 
     Args:
         folder        (str)      : ruta con TS_Q_*.csv y Qpeak_*.tif.
         dem_path      (str)      : ruta al DEM (requerido en Case 3).
-        min_valid_trs (int)      : mínimo TRs válidos para regresión (default 2).
         n_default     (float)    : n fijo cuando no hay TRs válidos (default 13.5).
         idf_table     (DataFrame): filas=duración, columnas=TR — requerido en Case 3.
         d_ds          (float)    : duración para lookup en idf_table (h).
         D             (float)    : duración de tormenta para Pe (h); None → usa d_ds.
         inf_raster    (str)      : raster de infiltración promedio (mm/h); opcional.
+        inf_correction(float)    : factor multiplicativo sobre inf_raster antes del
+                                   promedio (default 1.0 = sin corrección).
 
     Returns:
         None. Escribe:
@@ -3540,7 +3623,7 @@ def correct_hydrographs(
             _diagnostics/03_regressions.csv   (solo caso normal)
             _diagnostics/04_reconstruction.csv
             _diagnostics/05_basin_geometry.csv (solo Case 3)
-            _diagnostics/06_pe_by_tr.csv       (solo Case 3)
+            _diagnostics/06_Qp_pe_tr.csv       (solo Case 3)
             _diagnostics/plots/
     """
     diag = os.path.join(folder, '_diagnostics')
@@ -3553,6 +3636,11 @@ def correct_hydrographs(
             dst = os.path.join(backup, name)
             if not os.path.exists(dst):
                 shutil.copy2(os.path.join(folder, name), dst)
+
+    for sc in SCENARIOS:
+        for tr in TRS:
+            name = f'TS_Q_{sc}_TR-{tr}.csv'
+            shutil.copy2(os.path.join(backup, name), os.path.join(folder, name))
 
     # ------------------------------------------------------------------
     # 1. Cargar todos los CSV
@@ -3597,10 +3685,16 @@ def correct_hydrographs(
                 'reason': reason,
             })
 
+    regression_trs = _select_regression_trs(valid_trs, TRS)
+    invalid_trs = [tr for tr in TRS if tr not in set(regression_trs)]
+    recon_set = set(invalid_trs)
+    for row in val_rows:
+        row['reconstructed'] = row['TR'] in recon_set
     pd.DataFrame(val_rows).to_csv(
         os.path.join(diag, '01_validation.csv'), index=False
     )
     print(f"TRs válidos   : {valid_trs}")
+    print(f"TRs regresión : {regression_trs}")
     print(f"TRs inválidos : {invalid_trs}")
 
     # ------------------------------------------------------------------
@@ -3608,18 +3702,18 @@ def correct_hydrographs(
     # ------------------------------------------------------------------
     if not invalid_trs:
         print("Todos los hidrogramas son válidos. Sin cambios.")
+        _write_display_status(diag, folder, None)
         return
 
     # ------------------------------------------------------------------
     # Determinar modo de reconstrucción
     # ------------------------------------------------------------------
-    fixed_params  = None   # {sc: (tp, dur, n)} — None = usar regresiones
-    case3_params  = None   # {A_km2, pe, dur} — solo Case 3
-    regressions   = None
-    reg_data      = None
+    case3_params = None  # {A_km2, pe, dur} — solo Case 3
+    regressions = None
+    reg_data = None
 
-    if not valid_trs:
-        # Case 3: ningún TR válido — tp via SCS (0.208*A*Pe/Qp), dur via Kirpich
+    if not regression_trs:
+        # Case 3: sin bloque consecutivo válido — tp via SCS (0.208*A*Pe/Qp), dur via Kirpich
         if idf_table is None:
             raise ValueError(
                 "Case 3: ningún TR válido — se requiere idf_table (filas=duración h, columnas=TR)."
@@ -3627,73 +3721,48 @@ def correct_hydrographs(
         mask_raster = os.path.join(folder, f'Qpeak_{SCENARIOS[0]}_TR-{TRS[0]}.tif')
         print("Sin TRs válidos. Calculando tc (Kirpich) y área de cuenca...")
         tc, L_m, S_mm = compute_tc_kirpich(dem_path, mask_raster)
-        A_km2        = compute_basin_area_km2(mask_raster)
-        dur_kirpich  = 5.0 * 0.6 * tc
-        _D           = D if D is not None else d_ds
+        A_km2 = compute_basin_area_km2(mask_raster)
+        dur_kirpich = 5.0 * 0.6 * tc
+        _D = D if D is not None else d_ds
         inf_avg_by_tr = {}
-        pe_by_tr      = {}
+        pe_by_tr = {}
         for tr in TRS:
-            I_tr         = float(idf_table.loc[d_ds, tr])
-            Inf_avg_tr   = (compute_mean_infiltration(inf_raster, mask_raster, threshold=I_tr)
-                            if inf_raster else 0.0)
+            I_tr = float(idf_table.loc[d_ds, tr])
+            Inf_avg_tr = (compute_mean_infiltration(inf_raster, mask_raster, threshold=I_tr,
+                                                    factor=inf_correction)
+                          if inf_raster else 0.0)
             inf_avg_by_tr[tr] = Inf_avg_tr
             pe = (I_tr - Inf_avg_tr) * _D
-            pe_by_tr[tr] = pe if pe > 0 else 1.0
-        case3_params = {'A_km2': A_km2, 'pe_by_tr': pe_by_tr, 'dur': dur_kirpich}
+            pe_by_tr[tr] = pe if pe > 0 else 0.0
+        case3_params = {'A_km2': A_km2, 'pe_by_tr': pe_by_tr, 'dur': dur_kirpich, 'L_km': round(L_m / 1000.0, 4)}
         print(f"  tc={tc:.2f}h  dur={dur_kirpich:.2f}h  A={A_km2:.2f}km²"
               f"  d_ds={d_ds}h  D={_D}h")
         geo_rows = [{
-            'L_km':       round(L_m / 1000.0, 4),
-            'slope_m_m':  round(float(S_mm), 6),
-            'tc_h':       round(tc, 4),
-            'dur_h':      round(dur_kirpich, 4),
-            'A_km2':      round(A_km2, 4),
-            'd_ds_h':     d_ds,
-            'D_h':        _D,
+            'L_km': round(L_m / 1000.0, 4),
+            'slope_m_m': round(float(S_mm), 6),
+            'tc_h': round(tc, 4),
+            'dur_h': round(dur_kirpich, 4),
+            'A_km2': round(A_km2, 4),
+            'd_ds_h': d_ds,
+            'D_h': _D,
         }]
         idf_rows = [
-            {'TR': tr, 'I_mm_h': round(float(idf_table.loc[d_ds, tr]), 4),
-             'inf_avg_mm': round(inf_avg_by_tr[tr], 4),
-             'pe_mm': round(pe_by_tr[tr], 4)}
+            {
+                'TR': tr,
+                **{f'qp_{sc}_m3s': round(get_qpeak_raster(folder, sc, tr), 6)
+                   for sc in SCENARIOS},
+                'I_mm_h': round(float(idf_table.loc[d_ds, tr]), 4),
+                'inf_raw_mm': round(inf_avg_by_tr[tr] / inf_correction, 4)
+                if inf_correction != 0.0 else 0.0,
+                'inf_correction': inf_correction,
+                'inf_avg_mm': round(inf_avg_by_tr[tr], 4),
+                'D_h': _D,
+                'pe_mm': round(pe_by_tr[tr], 4),
+            }
             for tr in TRS
         ]
         pd.DataFrame(geo_rows).to_csv(os.path.join(diag, '05_basin_geometry.csv'), index=False)
-        pd.DataFrame(idf_rows).to_csv(os.path.join(diag, '06_pe_by_tr.csv'), index=False)
-
-    elif len(valid_trs) < min_valid_trs:
-        # Case 2: pocos TRs válidos — calibrar y promediar parámetros por escenario
-        fixed_params = {}
-        calib_rows = []
-        for sc in SCENARIOS:
-            tps, durs, ns = [], [], []
-            for tr in valid_trs:
-                df = all_data[sc][tr]
-                t = df[COL_TIME].values
-                q_obs = df[COL_Q].values
-                tp, qp, dur = stats[tr][sc]
-                n_opt, rmse = calibrate_n(t, q_obs, qp, tp)
-                tps.append(tp)
-                durs.append(dur)
-                ns.append(n_opt)
-                calib_rows.append({
-                    'TR': tr, 'scenario': sc,
-                    'Qp_m3s': round(qp, 4),
-                    'tp_h': round(tp, 4),
-                    'n_calibrated': round(n_opt, 6),
-                    'RMSE_m3s': round(rmse, 6),
-                })
-            fixed_params[sc] = (
-                float(np.mean(tps)),
-                float(np.mean(durs)),
-                float(np.mean(ns)),
-            )
-        pd.DataFrame(calib_rows).to_csv(
-            os.path.join(diag, '02_n_calibrated.csv'), index=False
-        )
-        print(
-            f"TRs válidos ({len(valid_trs)}) < min_valid_trs ({min_valid_trs}). "
-            "Usando parámetros fijos por escenario."
-        )
+        pd.DataFrame(idf_rows).to_csv(os.path.join(diag, '06_Qp_pe_tr.csv'), index=False)
 
     else:
         # Normal: calibrar n + regresiones
@@ -3701,7 +3770,7 @@ def correct_hydrographs(
         reg_data = {sc: [] for sc in SCENARIOS}
 
         for sc in SCENARIOS:
-            for tr in valid_trs:
+            for tr in regression_trs:
                 df = all_data[sc][tr]
                 t = df[COL_TIME].values
                 q_obs = df[COL_Q].values
@@ -3723,14 +3792,14 @@ def correct_hydrographs(
         reg_rows = []
         regressions = {}
         for sc in SCENARIOS:
-            qp_arr  = np.array([d['qp']       for d in reg_data[sc]])
-            tp_arr  = np.array([d['tp']        for d in reg_data[sc]])
-            dur_arr = np.array([d['duration']  for d in reg_data[sc]])
-            n_arr   = np.array([d['n']         for d in reg_data[sc]])
+            qp_arr = np.array([d['qp'] for d in reg_data[sc]])
+            tp_arr = np.array([d['tp'] for d in reg_data[sc]])
+            dur_arr = np.array([d['duration'] for d in reg_data[sc]])
+            n_arr = np.array([d['n'] for d in reg_data[sc]])
             regressions[sc] = {
-                'f1_tp':       fit_regression(qp_arr, tp_arr),
+                'f1_tp': fit_regression(qp_arr, tp_arr),
                 'f2_duration': fit_regression(qp_arr, dur_arr),
-                'f3_n':        fit_regression(qp_arr, n_arr),
+                'f3_n': fit_regression(qp_arr, n_arr),
             }
             for fk, reg in regressions[sc].items():
                 reg_rows.append({
@@ -3751,26 +3820,62 @@ def correct_hydrographs(
     # ------------------------------------------------------------------
     recon_rows = []
     reconstructed: dict = {}
+    qp_all_trs: dict = {}
 
     for tr in invalid_trs:
+        qp_by_sc = {sc: get_qpeak_raster(folder, sc, tr) for sc in SCENARIOS}
+        qp_all_trs[tr] = qp_by_sc
+
+        qp_zero = any(qp == 0.0 for qp in qp_by_sc.values())
+        pe_zero = case3_params is not None and case3_params['pe_by_tr'][tr] <= 0.0
+        if qp_zero or pe_zero:
+            reason = "Qp=0" if qp_zero else "pe_neta≤0 (infiltración≥lluvia)"
+            print(f"  TR-{tr}: {reason} — CSV vacío, sin reconstrucción.")
+            for sc in SCENARIOS:
+                pd.DataFrame(columns=[COL_TIME, COL_Q]).to_csv(
+                    os.path.join(folder, f'TS_Q_{sc}_TR-{tr}.csv'),
+                    index=False,
+                )
+                recon_rows.append({
+                    'TR': tr, 'scenario': sc,
+                    'Qp_raster_m3s': 0.0,
+                    'tp_estimated_h': None,
+                    'duration_estimated_h': None,
+                    'n_estimated': None,
+                })
+            continue
+
+        if case3_params is not None:
+            _tlags_tr = {sc: case3_params['L_km'] / (2.7 * (qp_by_sc[sc] ** 0.33))
+                         for sc in SCENARIOS}
+            use_storm_branch = all(_D >= 0.5 * t for t in _tlags_tr.values())
+            print(f"TR-{tr} | rama: {'D>=0.5·tlag' if use_storm_branch else 'D<0.5·tlag'} "
+                  f"(todos los escenarios)")
+
         for sc in SCENARIOS:
-            qp_raster = get_qpeak_raster(folder, sc, tr)
+            qp_raster = qp_by_sc[sc]
 
             if case3_params is not None:
-                pe_tr   = case3_params['pe_by_tr'][tr]
-                tp_est  = (0.208 * case3_params['A_km2'] * pe_tr) / qp_raster
-                # En el supuesto de un hidrograma unitario triangular (según el método del SCS/NRCS)
-                dur_est = 2.67*tp_est #case3_params['dur']
-                n_est   = max(n_default, 1.001)
-            elif fixed_params is not None:
-                tp_est, dur_est, n_est = fixed_params[sc]
-                n_est = max(n_est, 1.001)
-            else:
-                tp_est  = float(regressions[sc]['f1_tp']['predict'](qp_raster))
-                dur_est = float(regressions[sc]['f2_duration']['predict'](qp_raster))
-                n_est   = max(float(regressions[sc]['f3_n']['predict'](qp_raster)), 1.001)
+                print("Onda Cinemática Simplificada mediante Relaciones de Leopold-Maddock")
+                pe_tr = case3_params['pe_by_tr'][tr]
+                tlag = _tlags_tr[sc]
+                if use_storm_branch:
+                    tp_est = (_D / 2) + tlag
+                    dur_est = (_D / 2) + (2.67 * tlag)
+                    print(f"Condicion: D >= (0.5*tlag)")
+                else:
+                    tp_est = 1.67 * tlag
+                    dur_est = 2.67 * tlag
+                    print(f"Condicion: D < (0.5*tlag)")
 
-            t     = np.linspace(0.0, dur_est, n_points)
+                print(f"Sce: {sc} | TR: {tr} | tlag(h): {tlag} | tp_est(h): {tp_est} | dur_est(h): {dur_est}")
+                n_est = max(n_default, 1.001)
+            else:
+                tp_est = float(regressions[sc]['f1_tp']['predict'](qp_raster))
+                dur_est = float(regressions[sc]['f2_duration']['predict'](qp_raster))
+                n_est = max(float(regressions[sc]['f3_n']['predict'](qp_raster)), 1.001)
+
+            t = np.linspace(0.0, dur_est, n_points)
             q_new = scs_q(t, qp_raster, tp_est, n_est)
 
             df_new = pd.DataFrame({COL_TIME: t, COL_Q: q_new})
@@ -3782,17 +3887,19 @@ def correct_hydrographs(
             reconstructed[(sc, tr)] = (t, q_new)
             recon_rows.append({
                 'TR': tr, 'scenario': sc,
-                'Qp_raster_m3s':        round(qp_raster, 4),
-                'tp_estimated_h':       round(tp_est, 4),
+                'Qp_raster_m3s': round(qp_raster, 4),
+                'tp_estimated_h': round(tp_est, 4),
                 'duration_estimated_h': round(dur_est, 4),
-                'n_estimated':          round(n_est, 6),
+                'n_estimated': round(n_est, 6),
             })
 
     pd.DataFrame(recon_rows).to_csv(
         os.path.join(diag, '04_reconstruction.csv'), index=False
     )
 
-    _plot_hydrographs(diag, all_data, reconstructed, valid_trs, invalid_trs)
+    _write_display_status(diag, folder, case3_params)
+
+    _plot_hydrographs(diag, all_data, reconstructed, regression_trs, invalid_trs)
 
     print(f"Diagnosticos  : {diag}")
     print(f"Hidrogramas reconstruidos: {len(invalid_trs) * len(SCENARIOS)}")
@@ -4009,19 +4116,14 @@ def BashFastFlood(JSONPath, SaveFullCSV=False):
 
     # ------------------------------------------------------------------------------------------------------------------
     # Generar IDF y obtener tormenta de diseño
-    # ------------------------------------------------------------------------------------------------------------------
-    carpeta_tiles = os.path.join(UserData["DamagesDataBasePath"], "03-IDF")
-    aoi_path    = UserData['CatchmentPath']
-    ruta_salida = os.path.join(UserData['ProjectPath'], UserData["NameBasinFolder"], 'in', '06-FLOOD', 'Raster','IDF.csv')
-    df_idf = calcular_estadisticas_idf_cuenca(
-        carpeta_tiles,
-        aoi_path,
-        'mean')
-
-    # Del raster original se tienen las precipitaciones totales por cada duración por TR. Para generar la intensidades
-    # dividimos por la duración
-    df_idf = df_idf / np.array([[3], [6], [12], [24], [48], [72], [120], [240]])
-    df_idf.to_csv(ruta_salida)
+    # ------------------------------------------------------------------------------------------------------------------    
+    PathIDF  = os.path.join(UserData['ProjectPath'], UserData["NameBasinFolder"], 'in', '06-FLOOD', 'Raster','IDF.csv')
+    # Read csv
+    df_idf   = pd.read_csv(PathIDF, index_col=0)
+    # 2. Convertimos el índice a numérico
+    df_idf.index = pd.to_numeric(df_idf.index)
+    # 3. Convertimos los nombres de las columnas a numérico
+    df_idf.columns = pd.to_numeric(df_idf.columns)
 
     # ------------------------------------------------------------------------------------------------------------------
     # Ejecutar Escenarios (Historic, BaU, NbS)
@@ -4063,16 +4165,20 @@ def BashFastFlood(JSONPath, SaveFullCSV=False):
                              BoundaryCondition=BoundaryCondition,
                              log=log, IDF_Table=df_idf, StatusExe=True)
 
+
     # ------------------------------------------------------------------------------------------------------------------
     # Check - Reconstrucción de hidrogramas dañados por inestabilidad numérica
     # ------------------------------------------------------------------------------------------------------------------
+    # leer factor de correción de infiltración
+    FactorInf = pd.read_csv(os.path.join(os.path.dirname(UserData["InfiltrationPath"]),'FactorCorrect.csv'))
     DischargePath  = ProjectPath + f'/out/06-FLOOD/Discharge'
     correct_hydrographs(folder=DischargePath,
                         dem_path=UserData["DEMPath"],
-                        idf_table=df_idf,
                         d_ds=UserData["ClimateParams"]["DesignStormDuration_Historic"],
                         D=UserData["ClimateParams"]["AnalysisStormDuration"],
-                        inf_raster=UserData["InfiltrationPath"])
+                        inf_raster=UserData["InfiltrationPath"],
+                        idf_table=df_idf,
+                        inf_correction=FactorInf.values[0][0])
 
     # ------------------------------------------------------------------------------------------------------------------
     # Check - Se verifica que las profundidades del escenario BaU nunca sean menores que las del escenario Current,
