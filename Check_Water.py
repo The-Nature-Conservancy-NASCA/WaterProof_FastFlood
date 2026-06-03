@@ -480,8 +480,9 @@ def calcular_estadisticas_idf_cuenca(carpeta_rasters, shapefile_cuenca, estadist
     -----------
     carpeta_rasters : str
         Ruta a la carpeta con rasters con nombres tipo: IDF_TR_2_D_240
-    shapefile_cuenca : str
-        Ruta al shapefile de la cuenca
+    shapefile_cuenca : str or dict or list
+        Ruta al shapefile de la cuenca, o geometría en formato GeoJSON.
+        Acepta: FeatureCollection, Feature, geometría directa, o lista de features
     estadistica : str
         Estadística a calcular: 'mean', 'min', 'max', 'std', 'median', 'sum'
 
@@ -493,7 +494,24 @@ def calcular_estadisticas_idf_cuenca(carpeta_rasters, shapefile_cuenca, estadist
 
     # Cargar cuenca
     print("Cargando cuenca...")
-    cuenca = gpd.read_file(shapefile_cuenca)
+    if isinstance(shapefile_cuenca, dict):
+        # Si es GeoJSON
+        if shapefile_cuenca.get('type') == 'FeatureCollection':
+            # FeatureCollection: extraer features
+            cuenca = gpd.GeoDataFrame.from_features(shapefile_cuenca['features'], crs='EPSG:4326')
+        elif shapefile_cuenca.get('type') == 'Feature':
+            # Feature individual
+            cuenca = gpd.GeoDataFrame.from_features([shapefile_cuenca], crs='EPSG:4326')
+        else:
+            # Geometría directa (Polygon, MultiPolygon, etc.)
+            cuenca = gpd.GeoDataFrame([{'geometry': shape(shapefile_cuenca)}], crs='EPSG:4326')
+    elif isinstance(shapefile_cuenca, list):
+        # Lista de features
+        cuenca = gpd.GeoDataFrame.from_features(shapefile_cuenca, crs='EPSG:4326')
+    else:
+        # Si es ruta de archivo
+        cuenca = gpd.read_file(shapefile_cuenca)
+
     if cuenca.crs != 'EPSG:4326':
         cuenca = cuenca.to_crs('EPSG:4326')
 
@@ -630,8 +648,10 @@ def statistical_zonal_raster(
         Ruta al raster de entrada (.tif).
     stat : str
         Estadística: 'mean', 'sum', 'min', 'max'.
-    polygon_path : str, opcional
-        Máscara por polígono (shapefile/GeoJSON). Exclusivo con mask_raster.
+    polygon_path : str | dict | list | GeoDataFrame, opcional
+        Máscara por polígono. Acepta: ruta a shapefile/GeoJSON, GeoJSON dict
+        (FeatureCollection, Feature o geometría directa), lista de features,
+        o GeoDataFrame. Exclusivo con mask_raster.
     mask_raster : str, opcional
         Máscara por raster (píxeles > 0 y finitos). Exclusivo con polygon_path.
     threshold : float, opcional
@@ -710,11 +730,29 @@ def statistical_zonal_raster(
         del data
 
     elif polygon_path is not None:
-        with fiona.open(polygon_path) as poly_src:
-            polygon = unary_union([shape(f["geometry"]) for f in poly_src])
-        geom_list = [polygon.__geo_interface__]
+        if isinstance(polygon_path, gpd.GeoDataFrame):
+            gdf = polygon_path
+        elif isinstance(polygon_path, dict):
+            if polygon_path.get("type") == "FeatureCollection":
+                gdf = gpd.GeoDataFrame.from_features(polygon_path["features"], crs="EPSG:4326")
+            elif polygon_path.get("type") == "Feature":
+                gdf = gpd.GeoDataFrame.from_features([polygon_path], crs="EPSG:4326")
+            else:
+                gdf = gpd.GeoDataFrame([{"geometry": shape(polygon_path)}], crs="EPSG:4326")
+        elif isinstance(polygon_path, list):
+            gdf = gpd.GeoDataFrame.from_features(polygon_path, crs="EPSG:4326")
+        else:
+            gdf = gpd.read_file(polygon_path)
 
         with rasterio.open(raster_path) as rst:
+            if not isinstance(polygon_path, str) and gdf.crs is not None:
+                from pyproj import CRS as ProjCRS
+                src = ProjCRS.from_user_input(gdf.crs)
+                dst = ProjCRS.from_wkt(rst.crs.to_wkt())
+                if not src.equals(dst):
+                    gdf = gdf.to_crs(dst)
+            polygon = unary_union(gdf.geometry.values)
+            geom_list = [polygon.__geo_interface__]
             nodata = rst.nodata
             poly_win_raw = from_bounds(*polygon.bounds, rst.transform)
             raster_win = Window(0, 0, rst.width, rst.height)
@@ -854,28 +892,3 @@ def Check_Available_water(PathDataBase: str, PathWatershed: str, Inf_Path: str,
     D = IDF_Table.index.values.reshape(-1, 1)
     
     return D.flatten()[mask]
-
-
-# python Check_Water.py <PathDataBase> <PathWatershed> <Inf_Path>
-if __name__ == "__main__":
-    # import sys
-    #
-    # if len(sys.argv) != 6:
-    #     print("Uso: python Check_Water.py <PathDataBase> <PathWatershed> <Inf_Path>")
-    #     sys.exit(1)
-    #
-    # PathDataBase         = sys.argv[1]
-    # PathWatershed        = sys.argv[2]
-    # Inf_Path = sys.argv[3]
-
-    PathDataBase=r"/mnt/c/WSL/01-WaterProof/DamagesDataBase"
-    PathWatershed=r"/mnt/c/WSL/01-WaterProof/10-WaterCheck/Marne/watershed/watershed.shp"
-    Inf_Path=r"/mnt/c/WSL/01-WaterProof/10-WaterCheck/Marne/Infiltration.tif"
-    DEM_Path="/mnt/c/WSL/01-WaterProof/10-WaterCheck/Marne/DEM.tif"
-    Manning_Path="/mnt/c/WSL/01-WaterProof/10-WaterCheck/Marne/Manning.tif"
-    FastFloodPath="/mnt/c/WSL/01-WaterProof/01-Exe/FastFlood_21052025"
-    customurl="https://dev.water-proof.org/wf-models/get-ff-data?dataset={d}&x={x}&y={y}&z={z}&date=&key=DGD3BHF78LNRX9A"
-    duraciones = Check_Available_water(PathDataBase, PathWatershed, Inf_Path,
-                          DEM_Path, Manning_Path, FastFloodPath, customurl)
-
-    print(f"Duraciones donde intensidad TR=10 > infiltración mínima (h): {duraciones}")
