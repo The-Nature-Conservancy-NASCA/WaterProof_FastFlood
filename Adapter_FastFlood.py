@@ -1396,7 +1396,12 @@ def DesaggregationData(Data, NameCol, NBS, Time):
     for col in NameCol:           
         Wmax = Data[col].iloc[1]    
         Wo   = Data[col].iloc[0]
-        Results_BaU[col] = Sigmoid_Desaggregation(Wmax, Wo, r, t)
+        # Este control se aplica cuando no se tienen daños para una categoría en particular
+        # Si los valores son "0" se asigna la desagregación en "0"
+        if Wo > 0:
+            Results_BaU[col] = Sigmoid_Desaggregation(Wmax, Wo, r, t)
+        else:
+            Results_BaU[col] = t*0
 
     # ------------------------------------------------------------------------------------------------------------------
     # NBS
