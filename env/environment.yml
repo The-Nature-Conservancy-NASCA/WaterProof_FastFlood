@@ -1,0 +1,27 @@
+# Entorno portable de FastFlood (conda / mamba / micromamba; Linux, WSL, Windows, macOS)
+# Crear:  micromamba create -f env/environment.yml   (o conda / mamba env create -f ...)
+name: FastFlood
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - gdal=3.9
+  - numpy=1.26
+  - pandas=2.2
+  - scipy=1.15
+  - matplotlib=3.10
+  - shapely=2.0
+  - pyproj=3.6
+  - fiona=1.10
+  - geopandas=1.0
+  - pyogrio
+  - rasterio=1.4
+  - psutil
+  - tqdm
+  - openpyxl
+  - folium
+  - pytest
+  - pip
+  - pip:
+      - customtkinter==6.0.0
+      - whitebox==2.3.6

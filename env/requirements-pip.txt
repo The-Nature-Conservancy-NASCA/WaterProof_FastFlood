@@ -1,0 +1,14 @@
+affine==2.4.0
+cligj==0.7.2
+customtkinter==6.0.0
+darkdetect==0.8.0
+geopandas==1.0.1
+iniconfig==2.3.0
+pluggy==1.6.0
+psutil==7.2.2
+Pygments==2.20.0
+pyogrio==0.10.0
+pyparsing==3.2.1
+pytest==9.1.1
+rasterio==1.4.3
+whitebox==2.3.6

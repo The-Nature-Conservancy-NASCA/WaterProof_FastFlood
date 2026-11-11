@@ -7,6 +7,63 @@
 
 ---
 
+## 0. Instalación del entorno
+
+Los archivos para replicar el entorno están en `env/`. Funcionan con **conda**, **mamba** o **micromamba**.
+
+| Archivo | Uso |
+|---|---|
+| `env/environment.yml` | **Recomendado.** Entorno portable (solo `conda-forge`, versiones principales fijadas). Linux, WSL, Windows o macOS. |
+| `env/FastFlood_spec.txt` | Réplica **exacta** (paquete a paquete) del entorno original. Solo `linux-64` (Linux/WSL). |
+| `env/requirements-pip.txt` | Paquetes pip que complementan a `FastFlood_spec.txt`. |
+
+### Opción A — Entorno portable (recomendada)
+
+```bash
+# conda
+conda env create -f env/environment.yml
+# mamba
+mamba env create -f env/environment.yml
+# micromamba
+micromamba create -f env/environment.yml
+```
+
+### Opción B — Réplica exacta (Linux/WSL)
+
+```bash
+# conda / mamba (cambiar "conda" por "mamba" si aplica)
+conda create -n FastFlood --file env/FastFlood_spec.txt
+conda activate FastFlood
+pip install -r env/requirements-pip.txt
+
+# micromamba
+micromamba create -n FastFlood -f env/FastFlood_spec.txt
+micromamba activate FastFlood
+pip install -r env/requirements-pip.txt
+```
+
+### Verificación
+
+```bash
+conda activate FastFlood   # o: micromamba activate FastFlood
+python -c "from osgeo import gdal; import rasterio, geopandas; print('GDAL', gdal.__version__, '| rasterio', rasterio.__version__)"
+```
+
+### Notas
+
+- Si aparece un error de tipo `Could not solve for environment specs` por conflicto de canales, verificar que `conda-forge` sea el canal prioritario (`conda config --show channels`) o añadir `--channel-priority flexible`.
+- En la opción A, `rasterio` 1.4 exige GDAL ≥ 3.9 en `conda-forge`; por eso el entorno portable usa GDAL 3.9 (el entorno original tenía GDAL 3.6.2 para `osgeo` y 3.9.3 dentro de `rasterio`).
+- Para regenerar los archivos tras cambiar el entorno original:
+
+```bash
+conda activate FastFlood
+conda list --explicit > env/FastFlood_spec.txt
+pip freeze | grep -v "@ file://" > env/requirements-pip.txt
+# actualizar a mano env/environment.yml si se agregan o cambian dependencias principales
+```
+
+---
+
 ## 1. Propósito general del adaptador
 
 El adaptador FastFlood es el componente de WaterProof encargado de traducir la configuración de un caso de estudio en una secuencia completa de modelación hidráulica y evaluación económica. Su función principal es tomar los insumos definidos por el usuario en WaterProof, construir los escenarios hidrológico-hidráulicos requeridos, ejecutar FastFlood para múltiples periodos de retorno, estimar daños por inundación para distintas categorías de exposición y transferir los resultados al módulo financiero de ROI.
